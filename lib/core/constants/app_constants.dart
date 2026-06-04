@@ -1,6 +1,6 @@
 class AppConstants {
   static const String appName = 'CIT App';
-  static const String appVersion = '1.0.0';
+  static const String appVersion = '2.2.0';
   
   // 許可されたドメイン（複数対応）
   static const List<String> allowedDomains = [

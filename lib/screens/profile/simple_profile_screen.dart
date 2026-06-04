@@ -6,6 +6,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:go_router/go_router.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import '../../core/constants/app_constants.dart';
 import '../../core/providers/theme_provider.dart';
 import '../../core/providers/admin_provider.dart';
 import '../../core/providers/auth_provider.dart';
@@ -406,10 +407,10 @@ class SimpleProfileScreen extends ConsumerWidget {
           ),
           const Divider(height: 1),
 
-          const ListTile(
-            leading: Icon(Icons.info),
-            title: Text('バージョン'),
-            subtitle: Text('2.0.0'),
+          ListTile(
+            leading: const Icon(Icons.info),
+            title: const Text('バージョン'),
+            subtitle: Text(AppConstants.appVersion),
           ),
 
           const Divider(height: 1),

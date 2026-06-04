@@ -13,6 +13,7 @@ import '../bulletin/bulletin_post_detail_screen.dart';
 import '../bulletin/bulletin_screen.dart';
 import '../../widgets/common/animated_image_placeholder.dart';
 import '../profile/simple_profile_screen.dart';
+import '../../core/constants/app_constants.dart';
 import '../../core/providers/auth_provider.dart';
 import '../../core/providers/bulletin_provider.dart';
 import '../../core/providers/settings_provider.dart';
@@ -72,7 +73,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
   int _lastTutorialReplaySignal = 0;
 
   static const String _tabTutorialSeenVersionKey = 'tab_tutorial_seen_version';
-  static const String _tabTutorialCurrentVersion = '2.0.0';
+  static const String _tabTutorialCurrentVersion = AppConstants.appVersion;
 
   // 安全なcurrentIndexゲッター
   int get safeCurrentIndex =>
