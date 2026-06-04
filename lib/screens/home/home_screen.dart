@@ -35,17 +35,19 @@ import '../cafeteria/cafeteria_reviews_screen.dart';
 import '../cafeteria/cafeteria_camera_info_screen.dart';
 import '../schedule/attendance_qr_reader_screen.dart';
 import '../../widgets/campus_map_widget.dart';
+import '../../widgets/home/train_access_home_card.dart';
 import '../../widgets/performance/optimized_notification_badge.dart';
 import '../../widgets/common/pulsing_dot_badge.dart';
 import '../../models/convenience_link/convenience_link_model.dart';
 import '../notification/notification_list_screen.dart';
-import '../convenience_link/convenience_link_edit_screen.dart';
+import '../convenience_link/convenience_links_manager_sheet.dart';
 import '../notification/unified_notification_screen.dart';
 import '../club/club_organizations_screen.dart';
 import '../../services/widget/home_widgets_service.dart';
 import '../../services/schedule/academic_calendar_service.dart';
 import '../../services/schedule/schedule_service.dart';
 import '../../services/schedule/attendance_service.dart';
+import '../../widgets/common/interactive_fullscreen_image_viewer.dart';
 import '../../widgets/schedule/schedule_class_detail_dialog_styles.dart';
 
 const Map<String, String> _campusNavigationOptions = {
@@ -86,6 +88,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     'timetable',
     'cafeteria',
     'bus',
+    'train_access',
     'campus_map',
     'academic_calendar',
     'convenience_links',
@@ -955,6 +958,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
         return _buildCafeteriaCard(context, ref, todayReviewExistsAsync);
       case 'bus':
         return _buildBusInfoCard(context, ref);
+      case 'train_access':
+        return const TrainAccessHomeCard();
       case 'campus_map':
         return _buildCampusMapCard(context);
       case 'academic_calendar':
@@ -1575,10 +1580,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     int month,
     List<AcademicCalendarEvent> allEvents,
   ) {
-    const weekdayLabels = ['月', '火', '水', '木', '金', '土', '日'];
+    final weekStart = ref.watch(calendarWeekStartProvider);
+    final weekdayLabels = weekStart == CalendarWeekStart.sunday
+        ? const ['日', '月', '火', '水', '木', '金', '土']
+        : const ['月', '火', '水', '木', '金', '土', '日'];
     final daysInMonth = DateUtils.getDaysInMonth(year, month);
-    final firstWeekday = DateTime(year, month, 1).weekday; // 1=Mon
-    final leadingEmptyCells = firstWeekday - 1;
+    final firstWeekday = DateTime(year, month, 1).weekday; // 1=Mon ... 7=Sun
+    final leadingEmptyCells = weekStart == CalendarWeekStart.sunday
+        ? firstWeekday % 7 // Sun=0, Mon=1, ... Sat=6
+        : firstWeekday - 1; // Mon=0, ... Sun=6
     final totalCells =
         ((leadingEmptyCells + daysInMonth + 6) ~/ 7) * 7; // 7の倍数に丸める
     final monthEvents = _eventsForMonth(allEvents, year, month);
@@ -1587,6 +1597,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       final key = _dateKey(event.date);
       eventsByDate.putIfAbsent(key, () => <AcademicCalendarEvent>[]).add(event);
     }
+    final now = DateTime.now();
+    final isCurrentMonth = year == now.year && month == now.month;
+    final todayColumnIndex = weekStart == CalendarWeekStart.sunday
+        ? now.weekday % 7
+        : now.weekday - 1;
 
     return Padding(
       padding: const EdgeInsets.all(12),
@@ -1600,13 +1615,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
           const SizedBox(height: 8),
           Row(
             children:
-                weekdayLabels.map((label) {
+                weekdayLabels.asMap().entries.map((entry) {
+                  final isTodayColumn =
+                      isCurrentMonth && entry.key == todayColumnIndex;
                   return Expanded(
                     child: Center(
                       child: Text(
-                        label,
+                        entry.value,
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           fontWeight: FontWeight.w700,
+                          color: isTodayColumn
+                              ? Theme.of(context).colorScheme.primary
+                              : null,
                         ),
                       ),
                     ),
@@ -1635,26 +1655,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                     (dayEvents != null && dayEvents.isNotEmpty)
                         ? dayEvents.first
                         : null;
+                final isToday =
+                    cellDate != null && _isTodayCalendarDate(cellDate);
 
                 return Container(
                   alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(6),
-                    color:
-                        isInCurrentMonth
-                            ? (representativeEvent != null
-                                ? _colorFromHex(
-                                  representativeEvent.colorHex,
-                                ).withOpacity(0.2)
-                                : Theme.of(context).colorScheme.surfaceContainerHighest)
-                            : Colors.transparent,
+                  decoration: _academicCalendarDayDecoration(
+                    context,
+                    isInCurrentMonth: isInCurrentMonth,
+                    isToday: isToday,
+                    representativeEvent: representativeEvent,
                   ),
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Text(
                         isInCurrentMonth ? '$dayNumber' : '',
-                        style: Theme.of(context).textTheme.bodyMedium,
+                        style: _academicCalendarDayTextStyle(
+                          context,
+                          isInCurrentMonth: isInCurrentMonth,
+                          isToday: isToday,
+                          baseStyle: Theme.of(context).textTheme.bodyMedium,
+                        ),
                       ),
                       if (dayEvents != null && dayEvents.isNotEmpty)
                         Padding(
@@ -1706,9 +1728,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     int month,
     List<AcademicCalendarEvent> allEvents,
   ) {
-    const weekdayLabels = ['月', '火', '水', '木', '金', '土', '日'];
+    final weekStart = ref.watch(calendarWeekStartProvider);
+    final weekdayLabels = weekStart == CalendarWeekStart.sunday
+        ? const ['日', '月', '火', '水', '木', '金', '土']
+        : const ['月', '火', '水', '木', '金', '土', '日'];
     final daysInMonth = DateUtils.getDaysInMonth(year, month);
-    final leadingEmptyCells = DateTime(year, month, 1).weekday - 1;
+    final firstWeekday = DateTime(year, month, 1).weekday; // 1=Mon ... 7=Sun
+    final leadingEmptyCells = weekStart == CalendarWeekStart.sunday
+        ? firstWeekday % 7
+        : firstWeekday - 1;
     final totalCells = ((leadingEmptyCells + daysInMonth + 6) ~/ 7) * 7;
     final monthEvents = _eventsForMonth(allEvents, year, month);
     final eventsByDate = <String, List<AcademicCalendarEvent>>{};
@@ -1716,6 +1744,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       final key = _dateKey(event.date);
       eventsByDate.putIfAbsent(key, () => <AcademicCalendarEvent>[]).add(event);
     }
+    final now = DateTime.now();
+    final isCurrentMonth = year == now.year && month == now.month;
+    final todayColumnIndex = weekStart == CalendarWeekStart.sunday
+        ? now.weekday % 7
+        : now.weekday - 1;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1729,13 +1762,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
         const SizedBox(height: 8),
         Row(
           children:
-              weekdayLabels.map((label) {
+              weekdayLabels.asMap().entries.map((entry) {
+                final isTodayColumn =
+                    isCurrentMonth && entry.key == todayColumnIndex;
                 return Expanded(
                   child: Center(
                     child: Text(
-                      label,
+                      entry.value,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
                         fontWeight: FontWeight.w700,
+                        color: isTodayColumn
+                            ? Theme.of(context).colorScheme.primary
+                            : null,
                       ),
                     ),
                   ),
@@ -1764,25 +1802,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                 (dayEvents != null && dayEvents.isNotEmpty)
                     ? dayEvents.first
                     : null;
+            final isToday =
+                cellDate != null && _isTodayCalendarDate(cellDate);
             return Container(
               alignment: Alignment.center,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(6),
-                color:
-                    isInCurrentMonth
-                        ? (representativeEvent != null
-                            ? _colorFromHex(
-                              representativeEvent.colorHex,
-                            ).withOpacity(0.2)
-                            : Theme.of(context).colorScheme.surfaceContainerHighest)
-                        : Colors.transparent,
+              decoration: _academicCalendarDayDecoration(
+                context,
+                isInCurrentMonth: isInCurrentMonth,
+                isToday: isToday,
+                representativeEvent: representativeEvent,
               ),
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Text(
                     isInCurrentMonth ? '$dayNumber' : '',
-                    style: Theme.of(context).textTheme.bodySmall,
+                    style: _academicCalendarDayTextStyle(
+                      context,
+                      isInCurrentMonth: isInCurrentMonth,
+                      isToday: isToday,
+                      baseStyle: Theme.of(context).textTheme.bodySmall,
+                    ),
                   ),
                   if (dayEvents != null && dayEvents.isNotEmpty)
                     Padding(
@@ -1828,6 +1868,53 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
 
   String _dateKey(DateTime date) {
     return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+  }
+
+  bool _isTodayCalendarDate(DateTime date) {
+    return DateUtils.isSameDay(date, DateTime.now());
+  }
+
+  BoxDecoration _academicCalendarDayDecoration(
+    BuildContext context, {
+    required bool isInCurrentMonth,
+    required bool isToday,
+    required AcademicCalendarEvent? representativeEvent,
+  }) {
+    if (!isInCurrentMonth) {
+      return BoxDecoration(borderRadius: BorderRadius.circular(6));
+    }
+
+    final colorScheme = Theme.of(context).colorScheme;
+    Color background;
+    if (isToday) {
+      background = colorScheme.primary.withValues(alpha: 0.2);
+    } else if (representativeEvent != null) {
+      background = _colorFromHex(representativeEvent.colorHex).withValues(alpha: 0.2);
+    } else {
+      background = colorScheme.surfaceContainerHighest;
+    }
+
+    return BoxDecoration(
+      borderRadius: BorderRadius.circular(6),
+      color: background,
+      border: isToday
+          ? Border.all(color: colorScheme.primary, width: 2)
+          : null,
+    );
+  }
+
+  TextStyle? _academicCalendarDayTextStyle(
+    BuildContext context, {
+    required bool isInCurrentMonth,
+    required bool isToday,
+    TextStyle? baseStyle,
+  }) {
+    if (!isInCurrentMonth) return baseStyle;
+    if (!isToday) return baseStyle;
+    return baseStyle?.copyWith(
+      color: Theme.of(context).colorScheme.primary,
+      fontWeight: FontWeight.bold,
+    );
   }
 
   static Color _colorFromHex(String hex) {
@@ -1929,6 +2016,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                       ),
                     ),
                     const Divider(height: 1),
+                    const TrainHomeCardCampusSetting(),
+                    const Divider(height: 1),
                     Expanded(
                       child: ReorderableListView.builder(
                         itemCount: tempOrder.length,
@@ -2006,6 +2095,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
         return '学食情報';
       case 'bus':
         return '学バス情報';
+      case 'train_access':
+        return trainHomeCardTitle(ref.read(preferredBusCampusProvider));
       case 'campus_map':
         return 'キャンパスマップ';
       case 'academic_calendar':
@@ -2035,6 +2126,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
         result.insert(convenienceIndex, 'academic_calendar');
       } else {
         result.add('academic_calendar');
+      }
+    }
+    if (!result.contains('train_access')) {
+      final busIndex = result.indexOf('bus');
+      if (busIndex >= 0) {
+        result.insert(busIndex + 1, 'train_access');
+      } else {
+        final campusIndex = result.indexOf('campus_map');
+        if (campusIndex >= 0) {
+          result.insert(campusIndex, 'train_access');
+        } else {
+          result.add('train_access');
+        }
       }
     }
     for (final id in _defaultHomeCardOrder) {
@@ -3563,143 +3667,118 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                         ),
                       ),
                     ],
-                  ],
-                ),
-                actions: [
-                  SizedBox(
-                    width: double.infinity,
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        reverse: false,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.center,
-                          children: [
-                            if (isEditingMemo) ...[
-                              TextButton(
-                                style:
-                                    scheduleClassDetailDialogSecondaryActionStyle(
-                                      dialogCtx,
-                                    ),
-                                onPressed: () => Navigator.of(dialogCtx).pop(),
-                                child: const Text('閉じる'),
-                              ),
-                              if (scheduleId != null && weekdayKey != null) ...[
-                                const SizedBox(width: 4),
-                                TextButton(
-                                  style:
-                                      scheduleClassDetailDialogSecondaryActionStyle(
-                                        dialogCtx,
-                                      ),
-                                  onPressed:
-                                      isSaving
-                                          ? null
-                                          : () {
-                                            setDialogState(() {
-                                              isEditingMemo = false;
-                                            });
-                                          },
-                                  child: const Text('キャンセル'),
-                                ),
-                              ],
-                              if (scheduleId != null && weekdayKey != null) ...[
-                                const SizedBox(width: 4),
-                                FilledButton(
-                                  style: scheduleClassDetailDialogSaveButtonStyle(
+                    scheduleClassDetailDialogActionsWrap(
+                      children: [
+                        if (isEditingMemo) ...[
+                          TextButton(
+                            style: scheduleClassDetailDialogSecondaryActionStyle(
+                              dialogCtx,
+                            ),
+                            onPressed: () => Navigator.of(dialogCtx).pop(),
+                            child: scheduleClassDetailDialogActionLabel('閉じる'),
+                          ),
+                          if (scheduleId != null && weekdayKey != null) ...[
+                            TextButton(
+                              style:
+                                  scheduleClassDetailDialogSecondaryActionStyle(
                                     dialogCtx,
                                   ),
-                                  onPressed:
-                                      isSaving
-                                          ? null
-                                          : () async {
-                                            setDialogState(() {
-                                              isSaving = true;
-                                            });
-                                            final ok = await _saveHomeClassNotesInline(
-                                              context: hostContext,
-                                              scheduleId: scheduleId,
-                                              weekdayKey: weekdayKey,
-                                              scheduleClass: scheduleClass,
-                                              notes:
-                                                  notesController.text.trim().isEmpty
-                                                      ? null
-                                                      : notesController.text.trim(),
-                                            );
-                                            if (!dialogCtx.mounted) return;
-                                            setDialogState(() {
-                                              isSaving = false;
-                                            });
-                                            if (ok) {
-                                              Navigator.of(dialogCtx).pop();
-                                            }
-                                          },
-                                  child:
-                                      isSaving
-                                          ? const SizedBox(
-                                              width: 14,
-                                              height: 14,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
-                                              ),
-                                            )
-                                          : const Text('保存'),
-                                ),
-                              ],
-                            ] else ...[
-                              if (scheduleClass.classroom.trim().isNotEmpty) ...[
-                                FilledButton(
-                                  style: scheduleClassLookupRoomButtonStyle(),
-                                  onPressed: () {
-                                    final q = scheduleClass.classroom.trim();
-                                    final uri = Uri(
-                                      path: '/classroom-map',
-                                      queryParameters: {'q': q},
-                                    );
-                                    Navigator.of(dialogCtx).pop();
-                                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                                      if (!hostContext.mounted) return;
-                                      GoRouter.of(hostContext).push(uri.toString());
-                                    });
-                                  },
-                                  child: const Text('教室の場所を調べる'),
-                                ),
-                              ],
-                              if (scheduleClass.classroom.trim().isNotEmpty &&
-                                  scheduleId != null &&
-                                  weekdayKey != null)
-                                const SizedBox(width: 4),
-                              if (scheduleId != null && weekdayKey != null)
-                                TextButton(
-                                  style:
-                                      scheduleClassDetailDialogSecondaryActionStyle(
-                                        dialogCtx,
-                                      ),
-                                  onPressed: () {
-                                    setDialogState(() {
-                                      isEditingMemo = true;
-                                    });
-                                  },
-                                  child: const Text('メモを編集'),
-                                ),
-                              if (scheduleClass.classroom.trim().isNotEmpty ||
-                                  (scheduleId != null && weekdayKey != null))
-                                const SizedBox(width: 4),
-                              TextButton(
-                                style: scheduleClassDetailDialogSecondaryActionStyle(
-                                  dialogCtx,
-                                ),
-                                onPressed: () => Navigator.of(dialogCtx).pop(),
-                                child: const Text('閉じる'),
+                              onPressed:
+                                  isSaving
+                                      ? null
+                                      : () {
+                                        setDialogState(() {
+                                          isEditingMemo = false;
+                                        });
+                                      },
+                              child: scheduleClassDetailDialogActionLabel('キャンセル'),
+                            ),
+                            FilledButton(
+                              style: scheduleClassDetailDialogSaveButtonStyle(
+                                dialogCtx,
                               ),
-                            ],
+                              onPressed:
+                                  isSaving
+                                      ? null
+                                      : () async {
+                                        setDialogState(() {
+                                          isSaving = true;
+                                        });
+                                        final ok = await _saveHomeClassNotesInline(
+                                          context: hostContext,
+                                          scheduleId: scheduleId,
+                                          weekdayKey: weekdayKey,
+                                          scheduleClass: scheduleClass,
+                                          notes:
+                                              notesController.text.trim().isEmpty
+                                                  ? null
+                                                  : notesController.text.trim(),
+                                        );
+                                        if (!dialogCtx.mounted) return;
+                                        setDialogState(() {
+                                          isSaving = false;
+                                        });
+                                        if (ok) {
+                                          Navigator.of(dialogCtx).pop();
+                                        }
+                                      },
+                              child:
+                                  isSaving
+                                      ? const SizedBox(
+                                          width: 18,
+                                          height: 18,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                          ),
+                                        )
+                                      : scheduleClassDetailDialogActionLabel('保存'),
+                            ),
                           ],
-                        ),
-                      ),
+                        ] else ...[
+                          if (scheduleClass.classroom.trim().isNotEmpty)
+                            FilledButton(
+                              style: scheduleClassLookupRoomButtonStyle(),
+                              onPressed: () {
+                                final q = scheduleClass.classroom.trim();
+                                final uri = Uri(
+                                  path: '/classroom-map',
+                                  queryParameters: {'q': q},
+                                );
+                                Navigator.of(dialogCtx).pop();
+                                WidgetsBinding.instance.addPostFrameCallback((_) {
+                                  if (!hostContext.mounted) return;
+                                  GoRouter.of(hostContext).push(uri.toString());
+                                });
+                              },
+                              child: scheduleClassDetailDialogActionLabel(
+                                '教室の場所を調べる',
+                              ),
+                            ),
+                          if (scheduleId != null && weekdayKey != null)
+                            TextButton(
+                              style:
+                                  scheduleClassDetailDialogSecondaryActionStyle(
+                                    dialogCtx,
+                                  ),
+                              onPressed: () {
+                                setDialogState(() {
+                                  isEditingMemo = true;
+                                });
+                              },
+                              child: scheduleClassDetailDialogActionLabel('メモを編集'),
+                            ),
+                          TextButton(
+                            style: scheduleClassDetailDialogSecondaryActionStyle(
+                              dialogCtx,
+                            ),
+                            onPressed: () => Navigator.of(dialogCtx).pop(),
+                            child: scheduleClassDetailDialogActionLabel('閉じる'),
+                          ),
+                        ],
+                      ],
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
         );
       },
@@ -5102,161 +5181,45 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   void _showBusTimetableImage(BuildContext context) {
     showDialog(
       context: context,
-      barrierColor: Colors.black87,
+      barrierColor: Colors.black,
       barrierDismissible: false,
       builder: (dialogContext) => Consumer(
         builder: (context, ref, child) {
           final imageUrlAsync = ref.watch(firebaseBusTimetableProvider);
-          
+
           return imageUrlAsync.when(
             data: (imageUrl) {
-              // データが取得できたら画像を表示
               if (imageUrl != null && imageUrl.isNotEmpty) {
-                return _buildFullScreenImageDialog(context, imageUrl, dialogContext);
-              } else {
-                return _buildFullScreenAssetImageDialog(context, dialogContext);
+                return interactiveFullscreenNetworkImageDialog(
+                  imageUrl: imageUrl,
+                  title: '学バス時刻表',
+                  maxScale: 5.0,
+                  fallbackAssetPath: 'assets/images/bus_timetable.png',
+                  errorMessage: 'バス時刻表の読み込みに失敗しました',
+                );
               }
-            },
-            loading: () {
-              // 読み込み中はローディング表示
-              return Dialog.fullscreen(
-                backgroundColor: Colors.black87,
-                child: const Center(
-                  child: CircularProgressIndicator(
-                    color: Colors.white,
-                  ),
-                ),
+              return interactiveFullscreenAssetImageDialog(
+                assetPath: 'assets/images/bus_timetable.png',
+                title: '学バス時刻表（オフライン版）',
+                maxScale: 5.0,
+                errorMessage: 'バス時刻表の読み込みに失敗しました',
               );
             },
-            error: (error, _) {
-              // エラー時はアセット画像を表示
-              return _buildFullScreenAssetImageDialog(context, dialogContext);
-            },
+            loading: () => Dialog.fullscreen(
+              backgroundColor: Colors.black87,
+              child: const Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ),
+            error: (error, _) => interactiveFullscreenAssetImageDialog(
+              assetPath: 'assets/images/bus_timetable.png',
+              title: '学バス時刻表（オフライン版）',
+              maxScale: 5.0,
+              errorMessage: 'バス時刻表の読み込みに失敗しました',
+            ),
           );
         },
       ),
-    );
-  }
-
-  // フルスクリーン画像ダイアログを構築
-  Widget _buildFullScreenImageDialog(BuildContext context, String imageUrl, BuildContext dialogContext) {
-    return _HomeScreenImageViewer(
-      imageUrl: imageUrl,
-      isAsset: false,
-      title: '学バス時刻表',
-    );
-  }
-
-  // フルスクリーンアセット画像ダイアログを構築
-  Widget _buildFullScreenAssetImageDialog(BuildContext context, BuildContext dialogContext) {
-    return _HomeScreenImageViewer(
-      imageUrl: 'assets/images/bus_timetable.png',
-      isAsset: true,
-      title: '学バス時刻表（オフライン版）',
-    );
-  }
-
-  // Firebaseからの画像をフルスクリーン表示
-  void _showFullScreenFirebaseImage(BuildContext context, String imageUrl) {
-    showDialog(
-      context: context,
-      barrierColor: Colors.black87,
-      builder: (context) => _HomeScreenImageViewer(
-        imageUrl: imageUrl,
-        isAsset: false,
-        title: '学バス時刻表',
-      ),
-    );
-  }
-
-  // ローディング画面をフルスクリーン表示
-  void _showFullScreenLoading(BuildContext context) {
-    showDialog(
-      context: context,
-      barrierColor: Colors.black87,
-      barrierDismissible: false,
-      builder: (context) => Dialog.fullscreen(
-        backgroundColor: Colors.black87,
-        child: const Center(
-          child: CircularProgressIndicator(
-            color: Colors.white,
-          ),
-        ),
-      ),
-    );
-  }
-
-  // アセット画像をフルスクリーン表示
-  void _showFullScreenAssetImage(BuildContext context) {
-    showDialog(
-      context: context,
-      barrierColor: Colors.black87,
-      builder: (context) => _HomeScreenImageViewer(
-        imageUrl: 'assets/images/bus_timetable.png',
-        isAsset: true,
-        title: '学バス時刻表（オフライン版）',
-      ),
-    );
-  }
-
-  // フルスクリーンのコントロール（共通）
-  Widget _buildFullScreenControls(BuildContext context, String title) {
-    return Stack(
-      children: [
-        // 閉じるボタン
-        Positioned(
-          top: MediaQuery.of(context).padding.top + 8,
-          right: 16,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.black54,
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: IconButton(
-              icon: const Icon(Icons.close, color: Colors.white),
-              onPressed: () => Navigator.of(context).pop(),
-            ),
-          ),
-        ),
-        // タイトル
-        Positioned(
-          top: MediaQuery.of(context).padding.top + 8,
-          left: 16,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.black54,
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Text(
-              title,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-        ),
-        // ピンチアウトのヒント（下部）
-        Positioned(
-          bottom: MediaQuery.of(context).padding.bottom + 16,
-          left: 16,
-          right: 16,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.black54,
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: const Text(
-              'ピンチで拡大・縮小、ドラッグで移動できます',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-          ),
-        ),
-      ],
     );
   }
 
@@ -5625,348 +5588,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
             minChildSize: 0.5,
             maxChildSize: 0.95,
             builder:
-                (context, scrollController) =>
-                    _buildLinksManagerSheet(context, ref, scrollController),
+                (context, scrollController) => ConvenienceLinksManagerSheet(
+                  scrollController: scrollController,
+                ),
           ),
     );
-  }
-
-  // リンク管理シートを構築
-  Widget _buildLinksManagerSheet(
-    BuildContext context,
-    WidgetRef ref,
-    ScrollController scrollController,
-  ) {
-    final linksAsync = ref.watch(currentUserConvenienceLinksProvider);
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // ハンドル
-          Center(
-            child: Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(
-                color: Colors.grey[300],
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-
-          // ヘッダー
-          Row(
-            children: [
-              Icon(
-                Icons.link_outlined,
-                size: 24,
-                color: Theme.of(context).colorScheme.primary,
-              ),
-              const SizedBox(width: 8),
-              Text('リンク管理', style: Theme.of(context).textTheme.titleLarge),
-              const Spacer(),
-              IconButton(
-                onPressed: () => _resetToDefaults(context, ref),
-                icon: const Icon(Icons.restore),
-                tooltip: 'デフォルトにリセット',
-              ),
-              IconButton(
-                onPressed: () => _addNewLink(context, ref),
-                icon: const Icon(Icons.add),
-                tooltip: '新しいリンクを追加',
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-
-          // リンク一覧
-          Expanded(
-            child: linksAsync.when(
-              data: (links) {
-                if (links.isEmpty) {
-                  return Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.link_off,
-                          size: 64,
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          'リンクがありません',
-                          style: TextStyle(
-                            fontSize: 18,
-                            color:
-                                Theme.of(context).colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                        const SizedBox(height: 24),
-                        ElevatedButton.icon(
-                          onPressed: () => _addNewLink(context, ref),
-                          icon: const Icon(Icons.add),
-                          label: const Text('最初のリンクを追加'),
-                        ),
-                      ],
-                    ),
-                  );
-                }
-
-                return ListView.builder(
-                  controller: scrollController,
-                  itemCount: links.length,
-                  itemBuilder: (context, index) {
-                    final link = links[index];
-                    return Card(
-                      child: ListTile(
-                        leading: Container(
-                          width: 40,
-                          height: 40,
-                          decoration: BoxDecoration(
-                            color: LinkColors.getColor(link.color),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Icon(
-                            LinkIcons.getIcon(link.iconName),
-                            color: Theme.of(context).colorScheme.surface,
-                            size: 20,
-                          ),
-                        ),
-                        title: Text(
-                          link.title,
-                          style: TextStyle(
-                            decoration:
-                                link.isEnabled
-                                    ? null
-                                    : TextDecoration.lineThrough,
-                            color:
-                                link.isEnabled
-                                    ? null
-                                    : Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                        subtitle: Text(
-                          Uri.parse(link.url).host,
-                          style: TextStyle(
-                            color:
-                                link.isEnabled
-                                    ? Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant
-                                    : Theme.of(
-                                      context,
-                                    ).colorScheme.onSurface.withOpacity(0.5),
-                          ),
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Switch(
-                              value: link.isEnabled,
-                              onChanged:
-                                  (value) =>
-                                      _toggleLinkEnabled(context, ref, link.id),
-                              materialTapTargetSize:
-                                  MaterialTapTargetSize.shrinkWrap,
-                            ),
-                            IconButton(
-                              onPressed: () => _editLink(context, ref, link),
-                              icon: const Icon(Icons.edit),
-                              iconSize: 20,
-                            ),
-                          ],
-                        ),
-                        onTap: () => _editLink(context, ref, link),
-                      ),
-                    );
-                  },
-                );
-              },
-              loading: () => const Center(child: CircularProgressIndicator()),
-              error:
-                  (error, _) => Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.error_outline,
-                          size: 64,
-                          color: Theme.of(context).colorScheme.error,
-                        ),
-                        const SizedBox(height: 16),
-                        Text('エラーが発生しました: $error'),
-                      ],
-                    ),
-                  ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // 新しいリンクを追加
-  Future<void> _addNewLink(BuildContext context, WidgetRef ref) async {
-    final authService = ref.read(authServiceProvider);
-    final currentUser = authService.currentUser;
-
-    if (currentUser?.uid.isEmpty != false) return;
-
-    final userId = currentUser!.uid;
-
-    final result = await Navigator.of(context).push<bool>(
-      MaterialPageRoute(
-        builder: (context) => ConvenienceLinkEditScreen(userId: userId),
-      ),
-    );
-
-    if (result == true) {
-      _refreshConvenienceLinkProviders(ref, currentUser.uid, currentUser.email);
-    }
-  }
-
-  // リンクを編集
-  Future<void> _editLink(
-    BuildContext context,
-    WidgetRef ref,
-    ConvenienceLink link,
-  ) async {
-    final authService = ref.read(authServiceProvider);
-    final currentUser = authService.currentUser;
-
-    if (currentUser?.uid.isEmpty != false) return;
-
-    final userId = currentUser!.uid;
-
-    final result = await Navigator.of(context).push<bool>(
-      MaterialPageRoute(
-        builder:
-            (context) =>
-                ConvenienceLinkEditScreen(initialLink: link, userId: userId),
-      ),
-    );
-
-    if (result == true) {
-      _refreshConvenienceLinkProviders(ref, currentUser.uid, currentUser.email);
-    }
-  }
-
-  void _refreshConvenienceLinkProviders(
-    WidgetRef ref,
-    String userId,
-    String? userEmail,
-  ) {
-    ref.invalidate(
-      convenienceLinkProvider((userId: userId, userEmail: userEmail)),
-    );
-    ref.invalidate(currentUserConvenienceLinksProvider);
-    ref.invalidate(enabledConvenienceLinksProvider);
-  }
-
-  // リンクの有効/無効を切り替え
-  Future<void> _toggleLinkEnabled(
-    BuildContext context,
-    WidgetRef ref,
-    String linkId,
-  ) async {
-    final authService = ref.read(authServiceProvider);
-    final currentUser = authService.currentUser;
-
-    if (currentUser?.uid.isEmpty != false) return;
-
-    final userId = currentUser!.uid;
-    final userEmail = currentUser.email;
-
-    try {
-      final notifier = ref.read(
-        convenienceLinkProvider((
-          userId: userId,
-          userEmail: userEmail,
-        )).notifier,
-      );
-      await notifier.toggleLinkEnabled(linkId);
-      ref.invalidate(currentUserConvenienceLinksProvider);
-      ref.invalidate(enabledConvenienceLinksProvider);
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('設定の変更に失敗しました: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
-
-  // デフォルトにリセット
-  Future<void> _resetToDefaults(BuildContext context, WidgetRef ref) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('デフォルトにリセット'),
-        content: const Text('すべてのリンクをデフォルトの状態にリセットしますか？\nカスタムリンクは削除されます。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('キャンセル'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            style: TextButton.styleFrom(
-              foregroundColor: Colors.red,
-            ),
-            child: const Text('リセット'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed != true) return;
-
-    final authService = ref.read(authServiceProvider);
-    final currentUser = authService.currentUser;
-
-    if (currentUser?.uid.isEmpty != false) return;
-
-    final userId = currentUser!.uid;
-    final userEmail = currentUser.email;
-
-    try {
-      final notifier = ref.read(
-        convenienceLinkProvider((
-          userId: userId,
-          userEmail: userEmail,
-        )).notifier,
-      );
-      await notifier.resetToDefaults();
-      ref.invalidate(currentUserConvenienceLinksProvider);
-      ref.invalidate(enabledConvenienceLinksProvider);
-      
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('デフォルトにリセットしました'),
-            backgroundColor: Colors.green,
-          ),
-        );
-      }
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('リセットに失敗しました: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
   }
 
   // 今日の曜日を取得する
@@ -6091,21 +5717,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   }
 }
 
-class _HomeScreenImageViewer extends StatefulWidget {
-  final String imageUrl;
-  final bool isAsset;
-  final String title;
-
-  const _HomeScreenImageViewer({
-    required this.imageUrl,
-    required this.isAsset,
-    required this.title,
-  });
-
-  @override
-  State<_HomeScreenImageViewer> createState() => _HomeScreenImageViewerState();
-}
-
 class _WeatherCampusLocation {
   final String key;
   final String label;
@@ -6148,201 +5759,4 @@ class _YearCalendarImageItem {
     required this.name,
     required this.downloadUrl,
   });
-}
-
-class _HomeScreenImageViewerState extends State<_HomeScreenImageViewer> {
-  late final TransformationController _transformationController;
-  static const double _zoomedScale = 2.5;
-
-  @override
-  void initState() {
-    super.initState();
-    _transformationController = TransformationController();
-  }
-
-  @override
-  void dispose() {
-    _transformationController.dispose();
-    super.dispose();
-  }
-
-  void _handleDoubleTap(TapDownDetails details) {
-    final scale = _transformationController.value.getMaxScaleOnAxis();
-    final isCurrentlyZoomed = scale > 1.1;
-
-    if (isCurrentlyZoomed) {
-      // 拡大中の場合、元のサイズに戻す
-      _transformationController.value = Matrix4.identity();
-    } else {
-      // 縮小時の場合、タップ位置を中心に拡大
-      final screenSize = MediaQuery.of(context).size;
-      final screenCenterX = screenSize.width / 2;
-      final screenCenterY = screenSize.height / 2;
-
-      // タップ位置をローカル座標から取得
-      final tapPosition = details.localPosition;
-      
-      // 画面中心からのオフセットを計算
-      final offsetX = tapPosition.dx - screenCenterX;
-      final offsetY = tapPosition.dy - screenCenterY;
-
-      final newScale = _zoomedScale;
-      
-      // タップ位置が画面中心に来るように変換行列を計算
-      final translateX = -offsetX * (newScale - 1) / newScale;
-      final translateY = -offsetY * (newScale - 1) / newScale;
-      
-      // スケールを先に適用してから平行移動を適用するため、Matrix4を直接構築
-      final matrix = Matrix4.identity()
-        ..scale(newScale)
-        ..translate(translateX / newScale, translateY / newScale);
-      
-      _transformationController.value = matrix;
-    }
-  }
-
-  Widget _buildFullScreenControls(BuildContext context, String title) {
-    return Stack(
-      children: [
-        // 閉じるボタン
-        Positioned(
-          top: MediaQuery.of(context).padding.top + 8,
-          right: 16,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.black54,
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: IconButton(
-              icon: const Icon(Icons.close, color: Colors.white),
-              onPressed: () => Navigator.of(context).pop(),
-            ),
-          ),
-        ),
-        // タイトル
-        Positioned(
-          top: MediaQuery.of(context).padding.top + 8,
-          left: 16,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.black54,
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Text(
-              title,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-        ),
-        // ピンチアウトのヒント（下部）
-        Positioned(
-          bottom: MediaQuery.of(context).padding.bottom + 16,
-          left: 16,
-          right: 16,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.black54,
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: const Text(
-              'ダブルタップで拡大・縮小、ドラッグで移動できます',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 12,
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Dialog.fullscreen(
-      backgroundColor: Colors.black87,
-      child: Stack(
-        children: [
-          Center(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onDoubleTapDown: _handleDoubleTap,
-              child: InteractiveViewer(
-                transformationController: _transformationController,
-                minScale: 0.5,
-                maxScale: 5.0,
-                child: widget.isAsset
-                    ? Image.asset(
-                        widget.imageUrl,
-                        fit: BoxFit.contain,
-                        errorBuilder: (context, error, stackTrace) {
-                          return const Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(Icons.error, color: Colors.white, size: 48),
-                                SizedBox(height: 16),
-                                Text(
-                                  'バス時刻表の読み込みに失敗しました',
-                                  style: TextStyle(color: Colors.white),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      )
-                    : (kIsWeb
-                        ? Image.network(
-                            widget.imageUrl,
-                            fit: BoxFit.contain,
-                            loadingBuilder: (context, child, loadingProgress) {
-                              if (loadingProgress == null) return child;
-                              return const Center(
-                                child: CircularProgressIndicator(
-                                  color: Colors.white,
-                                ),
-                              );
-                            },
-                            errorBuilder: (context, error, stackTrace) {
-                              return Image.asset(
-                                'assets/images/bus_timetable.png',
-                                fit: BoxFit.contain,
-                              );
-                            },
-                          )
-                        : Image.network(
-                            widget.imageUrl,
-                            fit: BoxFit.contain,
-                            cacheWidth: null,
-                            cacheHeight: null,
-                            loadingBuilder: (context, child, loadingProgress) {
-                              if (loadingProgress == null) return child;
-                              return const Center(
-                                child: CircularProgressIndicator(
-                                  color: Colors.white,
-                                ),
-                              );
-                            },
-                            errorBuilder: (context, error, stackTrace) {
-                              return Image.asset(
-                                'assets/images/bus_timetable.png',
-                                fit: BoxFit.contain,
-                              );
-                            },
-                          )),
-              ),
-            ),
-          ),
-          _buildFullScreenControls(context, widget.title),
-        ],
-      ),
-    );
-  }
 }

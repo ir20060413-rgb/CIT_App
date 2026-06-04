@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:cached_network_image/cached_network_image.dart';
@@ -8,22 +10,36 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../home/home_screen.dart';
 import '../schedule/schedule_screen.dart';
+import '../schedule/attendance_qr_reader_screen.dart';
 import '../bulletin/bulletin_post_form_screen.dart';
 import '../bulletin/bulletin_post_detail_screen.dart';
-import '../bulletin/bulletin_screen.dart';
 import '../../widgets/common/animated_image_placeholder.dart';
 import '../profile/simple_profile_screen.dart';
 import '../../core/constants/app_constants.dart';
+import '../community/community_screen.dart';
 import '../../core/providers/auth_provider.dart';
+import '../../core/providers/filtered_bulletin_provider.dart';
 import '../../core/providers/bulletin_provider.dart';
+import '../../core/providers/cwitter_provider.dart';
+import '../../core/providers/cwitter_composer_back_provider.dart';
+import '../../core/providers/schedule_provider.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/providers/admin_provider.dart';
 import '../../core/providers/comment_provider.dart';
+import '../../models/schedule/schedule_model.dart';
 import '../../services/bulletin/bulletin_service.dart';
+import '../../services/schedule/attendance_availability.dart';
+import '../../services/schedule/attendance_service.dart';
+import '../../services/schedule/class_notification_payload.dart';
+import '../../services/schedule/schedule_notification_service.dart';
+import '../../services/schedule/schedule_service.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../../models/bulletin/bulletin_model.dart';
 import '../../models/admin/admin_model.dart';
 import '../admin/admin_management_screen.dart';
+import '../../widgets/auth/legacy_email_migration_dialog.dart';
+import '../legal/community_legal_update_consent_gate.dart';
+import '../../widgets/common/ui_feedback_listener.dart';
 
 // モック画像の背景パターンを描画するCustomPainter
 class MockImagePainter extends CustomPainter {
@@ -71,27 +87,285 @@ class _MainScreenState extends ConsumerState<MainScreen> {
   bool _didCheckTabTutorial = false;
   bool _isTabTutorialShowing = false;
   int _lastTutorialReplaySignal = 0;
+  bool _didCheckEmailMigrationPrompt = false;
+  bool _isEmailMigrationPromptShowing = false;
+
+  StreamSubscription<String>? _notificationTapSub;
+  bool _handlingNotificationTap = false;
+  bool _didBootstrapScheduleNotifications = false;
 
   static const String _tabTutorialSeenVersionKey = 'tab_tutorial_seen_version';
   static const String _tabTutorialCurrentVersion = AppConstants.appVersion;
 
   // 安全なcurrentIndexゲッター
   int get safeCurrentIndex =>
-      (_currentIndex > 3 || _currentIndex < 0) ? 0 : _currentIndex;
+      (_currentIndex > 4 || _currentIndex < 0) ? 0 : _currentIndex;
 
   @override
   void initState() {
     super.initState();
-    _currentIndex = widget.initialTabIndex.clamp(0, 3);
+    _currentIndex = widget.initialTabIndex.clamp(0, 4);
 
     // 次のフレームでも確実にリセット
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _currentIndex > 3) {
+      if (mounted && _currentIndex > 4) {
         setState(() {
           _currentIndex = 0;
         });
       }
     });
+
+    // 講義通知タップを購読
+    _notificationTapSub =
+        ScheduleNotificationService.onNotificationTap.listen((payload) {
+      _handleScheduleNotificationPayload(payload);
+    });
+
+    // アプリが完全終了状態から通知タップで起動された場合に拾う
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final pending =
+          ScheduleNotificationService.consumePendingLaunchPayload();
+      if (pending != null) {
+        _handleScheduleNotificationPayload(pending);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _notificationTapSub?.cancel();
+    _notificationTapSub = null;
+    super.dispose();
+  }
+
+  /// 通知タップ時の payload を処理する。
+  ///
+  /// payload は [ClassNotificationPayload] が JSON 文字列にエンコードしたもの。
+  /// type が `class_attendance` 以外、または parse 失敗時は何もせずに無視する。
+  Future<void> _handleScheduleNotificationPayload(String payload) async {
+    if (_handlingNotificationTap) return;
+    _handlingNotificationTap = true;
+    try {
+      final parsed = ClassNotificationPayload.tryParse(payload);
+      if (parsed == null) {
+        debugPrint('⚠️ 通知 payload 解析失敗 or class_attendance 以外: $payload');
+        return;
+      }
+
+      // 時間割タブに切り替え
+      if (mounted && safeCurrentIndex != 1) {
+        setState(() {
+          _currentIndex = 1;
+        });
+        // 1フレーム待ってタブ切り替えを反映させる
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      if (!mounted) return;
+
+      // 出席可能時間判定は payload の startDateTime を基準に「今」で判定する。
+      // 通知が届いた時刻ではなく、ユーザーが実際にタップした瞬間で判定するため。
+      final now = DateTime.now();
+      final inWindow = AttendanceAvailability.isWithinWindow(
+        now: now,
+        startDateTime: parsed.startDateTime,
+      );
+
+      if (!inWindow) {
+        await _showOutOfAttendanceWindowDialog(
+          subjectName: parsed.subjectName,
+          startDateTime: parsed.startDateTime,
+        );
+        return;
+      }
+
+      // 出席可能時間内: 出席記録に必要な Schedule / ScheduleClass をロードする。
+      final userId = ref.read(currentUserIdProvider);
+      if (userId == null) {
+        debugPrint('⚠️ 通知タップ時 userId が null。出席記録はスキップして QR のみ起動。');
+      }
+
+      Schedule? schedule;
+      ScheduleClass? scheduleClass;
+      String? weekdayKey;
+      if (userId != null) {
+        try {
+          final schedules =
+              await ScheduleService.getAllSchedulesByUserId(userId);
+          if (schedules.isNotEmpty) {
+            schedule = schedules
+                .where((s) => s.id == parsed.scheduleId)
+                .firstOrNull;
+            schedule ??= schedules.first;
+            weekdayKey = _weekdayKeyFromInt(parsed.weekday);
+            if (weekdayKey != null) {
+              scheduleClass = schedule.timetable[weekdayKey]?[parsed.period];
+            }
+          }
+        } catch (e) {
+          debugPrint('⚠️ 通知タップ時の時間割ロード失敗: $e');
+        }
+      }
+
+      if (!mounted) return;
+
+      // 既存の QR リーダー画面を起動（既存ルート/画面をそのまま再利用）
+      String? scannedRaw;
+      try {
+        scannedRaw = await Navigator.of(context).push<String>(
+          MaterialPageRoute(
+            builder: (_) => const AttendanceQrReaderScreen(),
+          ),
+        );
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('QRリーダーを起動できませんでした: $e')),
+        );
+        return;
+      }
+      if (scannedRaw == null || scannedRaw.trim().isEmpty) return;
+
+      // 出席ポータルを外部ブラウザで開く（既存挙動を踏襲）
+      await _openAttendancePortalFromQr(scannedRaw);
+      if (!mounted) return;
+
+      // 出席記録（必要情報が揃っているときだけ）
+      if (userId == null ||
+          schedule == null ||
+          scheduleClass == null ||
+          weekdayKey == null) {
+        return;
+      }
+
+      try {
+        final result = await AttendanceService.markAttendanceFromTap(
+          userId: userId,
+          scheduleId: schedule.id,
+          schedule: schedule,
+          weekdayKey: weekdayKey,
+          startPeriod: parsed.period,
+          scheduleClass: scheduleClass,
+        );
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(result.message),
+            backgroundColor: result.success ? Colors.green : Colors.orange,
+          ),
+        );
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('出欠記録に失敗しました: $e')),
+        );
+      }
+    } finally {
+      _handlingNotificationTap = false;
+    }
+  }
+
+  /// アプリ起動時に通知 ON のユーザーへ、最新の時間割をもとに通知を再予約する。
+  /// 講義期間設定がある場合は、講義期間終了日までの通知を一度に予約する。
+  Future<void> _bootstrapScheduleNotifications() async {
+    try {
+      final notificationEnabled =
+          ref.read(scheduleNotificationEnabledProvider);
+      if (!notificationEnabled) return;
+
+      final userId = ref.read(currentUserIdProvider);
+      if (userId == null) return;
+
+      // 通知サービス初期化が main.dart の遅延処理で実行されるため、少しだけ待つ。
+      await Future<void>.delayed(const Duration(seconds: 3));
+      if (!mounted) return;
+
+      final schedules =
+          await ScheduleService.getAllSchedulesByUserId(userId);
+      if (schedules.isEmpty) return;
+      final selectedId = ref.read(selectedScheduleIdProvider);
+      final schedule = (selectedId != null
+              ? schedules.where((s) => s.id == selectedId).firstOrNull
+              : null) ??
+          schedules.first;
+      await ScheduleNotificationService.scheduleWeeklyNotifications(schedule);
+      debugPrint('🔁 起動時の授業通知再予約 完了 (scheduleId=${schedule.id})');
+    } catch (e) {
+      debugPrint('⚠️ 起動時の授業通知再予約に失敗: $e');
+    }
+  }
+
+  String? _weekdayKeyFromInt(int weekday) {
+    switch (weekday) {
+      case DateTime.monday:
+        return 'monday';
+      case DateTime.tuesday:
+        return 'tuesday';
+      case DateTime.wednesday:
+        return 'wednesday';
+      case DateTime.thursday:
+        return 'thursday';
+      case DateTime.friday:
+        return 'friday';
+      case DateTime.saturday:
+        return 'saturday';
+      case DateTime.sunday:
+        return 'sunday';
+      default:
+        return null;
+    }
+  }
+
+  Future<void> _showOutOfAttendanceWindowDialog({
+    required String subjectName,
+    required DateTime startDateTime,
+  }) async {
+    final timeText =
+        '${startDateTime.month}/${startDateTime.day} ${startDateTime.hour}:${startDateTime.minute.toString().padLeft(2, '0')}';
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.schedule, color: Colors.orange),
+            SizedBox(width: 8),
+            Text('出席可能時間外です'),
+          ],
+        ),
+        content: Text(
+          'この授業の出席受付時間外です。\n'
+          '対象: ${subjectName.isNotEmpty ? subjectName : "対象の授業"}（開始 $timeText）\n'
+          '受付: 開始${AttendanceAvailability.beforeMinutes}分前〜開始${AttendanceAvailability.afterMinutes}分後',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openAttendancePortalFromQr(String scannedRaw) async {
+    final raw = scannedRaw.trim();
+    final uri = Uri.tryParse(raw);
+    if (uri == null) return;
+    final isWeb =
+        (uri.scheme == 'http' || uri.scheme == 'https') && uri.host.isNotEmpty;
+    if (!isWeb) return;
+    try {
+      final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!opened && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('出席サイトを開けませんでした')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('出席サイトを開けませんでした: $e')),
+      );
+    }
   }
 
   void _navigateToSchedule() {
@@ -105,6 +379,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
     return [
       HomeScreen(onNavigateToSchedule: _navigateToSchedule),
       const ScheduleScreen(),
+      const CommunityScreen(),
       const BulletinScreen(),
       const SimpleProfileScreen(),
     ];
@@ -130,13 +405,27 @@ class _MainScreenState extends ConsumerState<MainScreen> {
             _maybeStartTabTutorial();
           });
         }
+        if (!_didBootstrapScheduleNotifications) {
+          _didBootstrapScheduleNotifications = true;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _bootstrapScheduleNotifications();
+          });
+        }
+        if (!_didCheckEmailMigrationPrompt) {
+          _didCheckEmailMigrationPrompt = true;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _maybeShowLegacyEmailMigrationPrompt(user.email);
+          });
+        }
         if (tutorialReplaySignal != _lastTutorialReplaySignal) {
           _lastTutorialReplaySignal = tutorialReplaySignal;
           WidgetsBinding.instance.addPostFrameCallback((_) {
             _maybeStartTabTutorial(force: true);
           });
         }
-        return _buildMainContent();
+        return CommunityLegalUpdateConsentGate(
+          child: _buildMainContent(),
+        );
       },
       loading:
           () =>
@@ -172,20 +461,12 @@ class _MainScreenState extends ConsumerState<MainScreen> {
     // 掲示板の最新投稿日と最終既読時刻からバッジ表示を判定
     final prefs = ref.watch(sharedPreferencesProvider);
     final lastSeenMs = prefs.getInt('bulletin_last_seen_at') ?? 0;
-    final latestPostsAsync = ref.watch(bulletinPostsProvider);
-    int latestMs = 0;
-    latestPostsAsync.when(
-      data: (posts) {
-        if (posts.isNotEmpty) {
-          latestMs = posts
-              .map((p) => p.createdAt.millisecondsSinceEpoch)
-              .reduce((a, b) => a > b ? a : b);
-        }
-      },
-      loading: () {},
-      error: (_, __) {},
-    );
+    final latestCreatedAt =
+        ref.watch(bulletinLatestPostCreatedAtProvider).valueOrNull;
+    final latestMs = latestCreatedAt?.millisecondsSinceEpoch ?? 0;
     final hasNewBulletin = latestMs > lastSeenMs;
+    final hasNewCwitter = ref.watch(hasNewCwitterPostsProvider);
+    final showCommunityNew = hasNewCwitter && safeCurrentIndex != 2;
 
     Widget currentScreen;
     switch (safeCurrentIndex) {
@@ -196,9 +477,12 @@ class _MainScreenState extends ConsumerState<MainScreen> {
         currentScreen = const ScheduleScreen();
         break;
       case 2:
-        currentScreen = const BulletinScreen();
+        currentScreen = const CommunityScreen();
         break;
       case 3:
+        currentScreen = const BulletinScreen();
+        break;
+      case 4:
         print('🔧 SimpleProfileScreenを直接表示します');
         currentScreen = const SimpleProfileScreen();
         break;
@@ -214,6 +498,12 @@ class _MainScreenState extends ConsumerState<MainScreen> {
       canPop: false,
       onPopInvokedWithResult: (bool didPop, Object? result) async {
         if (didPop) return;
+
+        final composerGate = ref.read(cwitterComposerBackGateProvider);
+        if (composerGate.shouldIntercept && composerGate.handleBack != null) {
+          await composerGate.handleBack!();
+          return;
+        }
 
         // ホーム画面以外の場合はホームに戻る
         if (_currentIndex != 0) {
@@ -234,16 +524,16 @@ class _MainScreenState extends ConsumerState<MainScreen> {
         body: currentScreen,
         bottomNavigationBar: BottomNavigationBar(
           currentIndex: safeCurrentIndex,
-          onTap: (index) {
+          onTap: uiFeedbackTabIndexHandler((index) {
             print('🔧 タブ ${index} がタップされました');
-            // インデックス範囲チェック（0-3の4つのタブ）
-            if (index >= 0 && index <= 3) {
+            // インデックス範囲チェック（0-4の5つのタブ）
+            if (index >= 0 && index <= 4) {
               setState(() {
                 _currentIndex = index;
               });
               print('🔧 _currentIndex を ${index} に設定しました');
               // 掲示板タブを開いたら既読時刻を更新
-              if (index == 2) {
+              if (index == 3) {
                 prefs.setInt(
                   'bulletin_last_seen_at',
                   DateTime.now().millisecondsSinceEpoch,
@@ -255,7 +545,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
                 _currentIndex = 0;
               });
             }
-          },
+          }),
           type: BottomNavigationBarType.fixed,
           items: [
             const BottomNavigationBarItem(icon: Icon(Icons.home), label: 'ホーム'),
@@ -264,8 +554,21 @@ class _MainScreenState extends ConsumerState<MainScreen> {
               label: '時間割',
             ),
             BottomNavigationBarItem(
-              icon: _bulletinIcon(hasNewBulletin),
-              activeIcon: _bulletinIcon(hasNewBulletin),
+              icon: _tabIconWithNewBadge(
+                Icons.groups_outlined,
+                showCommunityNew,
+                badgeLabel: 'New Cweet',
+              ),
+              activeIcon: _tabIconWithNewBadge(
+                Icons.groups,
+                showCommunityNew,
+                badgeLabel: 'New Cweet',
+              ),
+              label: '交流',
+            ),
+            BottomNavigationBarItem(
+              icon: _tabIconWithNewBadge(Icons.campaign, hasNewBulletin),
+              activeIcon: _tabIconWithNewBadge(Icons.campaign, hasNewBulletin),
               label: '掲示板',
             ),
             const BottomNavigationBarItem(
@@ -278,11 +581,15 @@ class _MainScreenState extends ConsumerState<MainScreen> {
     );
   }
 
-  static Widget _bulletinIcon(bool hasNew) {
+  static Widget _tabIconWithNewBadge(
+    IconData icon,
+    bool hasNew, {
+    String badgeLabel = 'NEW',
+  }) {
     return Stack(
       clipBehavior: Clip.none,
       children: [
-        const Icon(Icons.campaign),
+        Icon(icon),
         if (hasNew)
           Positioned(
             right: -6,
@@ -293,11 +600,11 @@ class _MainScreenState extends ConsumerState<MainScreen> {
                 color: Colors.redAccent,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: const Text(
-                'NEW',
+              child: Text(
+                badgeLabel,
                 style: TextStyle(
                   color: Colors.white,
-                  fontSize: 8,
+                  fontSize: badgeLabel.length > 3 ? 7 : 8,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -331,6 +638,18 @@ class _MainScreenState extends ConsumerState<MainScreen> {
         false;
   }
 
+  Future<void> _maybeShowLegacyEmailMigrationPrompt(String? email) async {
+    if (!mounted || _isEmailMigrationPromptShowing) return;
+    if (!LegacyEmailMigrationDialog.shouldShow(email)) return;
+
+    _isEmailMigrationPromptShowing = true;
+    try {
+      await LegacyEmailMigrationDialog.showIfNeeded(context, email: email);
+    } finally {
+      _isEmailMigrationPromptShowing = false;
+    }
+  }
+
   Future<void> _maybeStartTabTutorial({bool force = false}) async {
     if (!mounted || _isTabTutorialShowing) return;
     final prefs = ref.read(sharedPreferencesProvider);
@@ -361,13 +680,20 @@ class _MainScreenState extends ConsumerState<MainScreen> {
       ),
       const _TabTutorialStep(
         tabIndex: 2,
+        tabLabel: '交流',
+        title: 'キャンパス交流',
+        description:
+            'CwitterでCweetを共有したり、ちばちゃんねるで匿名の掲示板を利用できます。',
+      ),
+      const _TabTutorialStep(
+        tabIndex: 3,
         tabLabel: '掲示板',
         title: '掲示板の投稿申請',
         description:
             '右上の＋ボタンから掲示板投稿を申請できます。掲載ルールは右上のⓘアイコンから確認できます。',
       ),
       const _TabTutorialStep(
-        tabIndex: 3,
+        tabIndex: 4,
         tabLabel: 'マイページ',
         title: 'メインキャンパス設定',
         description: 'メインキャンパスを設定すると、そのキャンパスの情報が優先表示されます。',
@@ -422,46 +748,37 @@ class _MainScreenState extends ConsumerState<MainScreen> {
     } else {
       contentWidget = Text(step.description);
     }
-    final action = await showModalBottomSheet<String>(
+    // bottom sheet ではなく中央表示の AlertDialog にすることで、
+    // Android の 3 ボタンナビ領域とボタンが完全に分離され誤タップを防ぐ。
+    final action = await showDialog<String>(
       context: context,
-      isDismissible: false,
-      enableDrag: false,
-      useSafeArea: true,
-      builder:
-          (sheetContext) => Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '${step.title} (${step.tabLabel})',
-                  style: Theme.of(
-                    sheetContext,
-                  ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 10),
-                contentWidget,
-                const SizedBox(height: 14),
-                Row(
-                  children: [
-                    TextButton(
-                      onPressed: () => Navigator.of(sheetContext).pop('skip'),
-                      child: const Text('スキップ'),
-                    ),
-                    const Spacer(),
-                    FilledButton(
-                      onPressed:
-                          () => Navigator.of(
-                            sheetContext,
-                          ).pop(isLast ? 'done' : 'next'),
-                      child: Text(isLast ? '完了' : '次へ'),
-                    ),
-                  ],
-                ),
-              ],
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: Text('${step.title} (${step.tabLabel})'),
+          content: SingleChildScrollView(child: contentWidget),
+          actionsAlignment: MainAxisAlignment.spaceBetween,
+          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop('skip'),
+              style: TextButton.styleFrom(
+                minimumSize: const Size(72, 48),
+              ),
+              child: const Text('スキップ'),
             ),
-          ),
+            FilledButton(
+              onPressed: () => Navigator.of(
+                dialogContext,
+              ).pop(isLast ? 'done' : 'next'),
+              style: FilledButton.styleFrom(
+                minimumSize: const Size(112, 48),
+              ),
+              child: Text(isLast ? '完了' : '次へ'),
+            ),
+          ],
+        );
+      },
     );
 
     if (!mounted) return;
@@ -510,10 +827,33 @@ class BulletinScreen extends ConsumerStatefulWidget {
 
 class _BulletinScreenState extends ConsumerState<BulletinScreen> {
   String? _selectedCategoryId;
+  final _scrollController = ScrollController();
 
   @override
   void initState() {
     super.initState();
+    _scrollController.addListener(_onPostsScroll);
+  }
+
+  void _onPostsScroll() {
+    if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (position.pixels < position.maxScrollExtent - 240) return;
+
+    final feed = ref.read(bulletinFeedProvider);
+    if (feed.isLoading || feed.isLoadingMore || !feed.hasMore) return;
+    ref.read(bulletinFeedProvider.notifier).loadMore();
+  }
+
+  @override
+  void dispose() {
+    _scrollController.removeListener(_onPostsScroll);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _refreshBulletinFeed() async {
+    await ref.read(bulletinFeedProvider.notifier).refresh();
   }
 
   @override
@@ -618,7 +958,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
 
   Widget _buildAllPostsTab() {
     final postsAsync = ref.watch(
-      bulletinPostsByCategoryProvider(_selectedCategoryId),
+      filteredBulletinPostsByCategoryProvider(_selectedCategoryId),
     );
 
     return postsAsync.when(
@@ -654,9 +994,8 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                   ),
                   const SizedBox(height: 16),
                   ElevatedButton(
-                    onPressed: () {
-                      ref.invalidate(bulletinPostsProvider);
-                      ref.invalidate(bulletinPostsByCategoryProvider);
+                    onPressed: () async {
+                      await _refreshBulletinFeed();
                     },
                     child: const Text('再読み込み'),
                   ),
@@ -668,52 +1007,8 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
   }
 
   Widget _buildPinnedPostsTab() {
-    final postsAsync = ref.watch(pinnedBulletinPostsProvider);
-
-    return postsAsync.when(
-      data: (posts) => _buildPostsList(posts),
-      loading: () => const Center(child: CircularProgressIndicator()),
-      error:
-          (error, stack) => Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.error, size: 48, color: Colors.red),
-                  const SizedBox(height: 16),
-                  Text(
-                    'エラーが発生しました',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  const SizedBox(height: 8),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.red.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      '$error',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        fontFamily: 'monospace',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  ElevatedButton(
-                    onPressed: () {
-                      ref.invalidate(bulletinPostsProvider);
-                      ref.invalidate(bulletinPostsByCategoryProvider);
-                    },
-                    child: const Text('再読み込み'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-    );
+    final posts = ref.watch(pinnedBulletinPostsProvider);
+    return _buildPostsList(posts);
   }
 
   Widget _buildPostsList(List<BulletinPost> posts) {
@@ -736,12 +1031,12 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
       );
     }
 
+    final isLoadingMore = ref.watch(bulletinFeedIsLoadingMoreProvider);
+
     return RefreshIndicator(
-      onRefresh: () async {
-        ref.invalidate(bulletinPostsProvider);
-        ref.invalidate(bulletinPostsByCategoryProvider);
-      },
+      onRefresh: _refreshBulletinFeed,
       child: GridView.builder(
+        controller: _scrollController,
         padding: const EdgeInsets.all(16),
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: 2,
@@ -750,8 +1045,11 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
           // 少し横長にしてカードの高さを抑える
           childAspectRatio: 0.82,
         ),
-        itemCount: posts.length,
+        itemCount: posts.length + (isLoadingMore ? 1 : 0),
         itemBuilder: (context, index) {
+          if (index >= posts.length) {
+            return const Center(child: CircularProgressIndicator());
+          }
           final post = posts[index];
           return _buildPostCard(post);
         },
@@ -763,6 +1061,12 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
     final categoryColor = Color(
       int.parse('0xff${post.category.color.substring(1)}'),
     );
+    final theme = Theme.of(context);
+    final subInfoColor = theme.brightness == Brightness.dark
+        ? theme.colorScheme.onSurface.withValues(alpha: 0.82)
+        : Colors.grey.shade600;
+    final categoryLabelColor =
+        theme.brightness == Brightness.dark ? subInfoColor : categoryColor;
     final canManagePosts = ref.watch(canManagePostsProvider);
 
     return Card(
@@ -853,14 +1157,14 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                               Icon(
                                 _getCategoryIcon(post.category.icon),
                                 size: 14,
-                                color: categoryColor,
+                                color: categoryLabelColor,
                               ),
                               const SizedBox(width: 2),
                               Flexible(
                                 child: Text(
                                   post.category.name,
                                   style: TextStyle(
-                                    color: categoryColor,
+                                    color: categoryLabelColor,
                                     fontSize: 11,
                                     fontWeight: FontWeight.bold,
                                   ),
@@ -941,14 +1245,14 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                     children: [
                       Row(
                         children: [
-                          Icon(Icons.person, size: 14, color: Colors.grey[600]),
+                          Icon(Icons.person, size: 14, color: subInfoColor),
                           const SizedBox(width: 4),
                           Expanded(
                             child: Text(
                               post.authorName,
                               style: TextStyle(
                                 fontSize: 11,
-                                color: Colors.grey[600],
+                                color: subInfoColor,
                               ),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
@@ -966,14 +1270,14 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                               Icon(
                                 Icons.visibility,
                                 size: 14,
-                                color: Colors.grey[600],
+                                color: subInfoColor,
                               ),
                               const SizedBox(width: 2),
                               Text(
                                 '${post.viewCount}',
                                 style: TextStyle(
                                   fontSize: 11,
-                                  color: Colors.grey[600],
+                                  color: subInfoColor,
                                 ),
                               ),
                               if (post.allowComments) ...[
@@ -981,7 +1285,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                                 Icon(
                                   Icons.comment,
                                   size: 14,
-                                  color: Colors.grey[600],
+                                  color: subInfoColor,
                                 ),
                                 const SizedBox(width: 2),
                                 Consumer(
@@ -995,7 +1299,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                                             '${stats.totalComments}',
                                             style: TextStyle(
                                               fontSize: 11,
-                                              color: Colors.grey[600],
+                                              color: subInfoColor,
                                             ),
                                           ),
                                       loading:
@@ -1003,7 +1307,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                                             '0',
                                             style: TextStyle(
                                               fontSize: 11,
-                                              color: Colors.grey[600],
+                                              color: subInfoColor,
                                             ),
                                           ),
                                       error:
@@ -1011,7 +1315,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                                             '0',
                                             style: TextStyle(
                                               fontSize: 11,
-                                              color: Colors.grey[600],
+                                              color: subInfoColor,
                                             ),
                                           ),
                                     );
@@ -1025,7 +1329,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
                               _formatDate(post.createdAt),
                               style: TextStyle(
                                 fontSize: 11,
-                                color: Colors.grey[600],
+                                color: subInfoColor,
                               ),
                               textAlign: TextAlign.right,
                             ),
@@ -1183,8 +1487,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
         );
 
         // プロバイダーを更新
-        ref.invalidate(bulletinPostsProvider);
-        ref.invalidate(bulletinPostsByCategoryProvider);
+        await _refreshBulletinFeed();
       } catch (e) {
         ScaffoldMessenger.of(
           context,
@@ -1215,18 +1518,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
   }
 
   String _formatDate(DateTime date) {
-    final now = DateTime.now();
-    final difference = now.difference(date);
-
-    if (difference.inMinutes < 60) {
-      return '${difference.inMinutes}分前';
-    } else if (difference.inHours < 24) {
-      return '${difference.inHours}時間前';
-    } else if (difference.inDays < 7) {
-      return '${difference.inDays}日前';
-    } else {
-      return '${date.month}/${date.day}';
-    }
+    return '${date.year}/${date.month.toString().padLeft(2, '0')}/${date.day.toString().padLeft(2, '0')}';
   }
 
   void _showPostDetail(BulletinPost post) {
@@ -1244,11 +1536,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
 
     // 投稿が成功した場合、掲示板データを更新
     if (result == true) {
-      ref.invalidate(bulletinPostsProvider);
-      ref.invalidate(pinnedBulletinPostsProvider);
-      ref.invalidate(popularBulletinPostsProvider);
-      // 全てのカテゴリフィルターも無効化
-      ref.invalidate(bulletinPostsByCategoryProvider);
+      await _refreshBulletinFeed();
     }
   }
 
@@ -1259,13 +1547,9 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
             builder: (context) => BulletinPostEditScreen(post: post),
           ),
         )
-        .then((result) {
+        .then((result) async {
           if (result == true) {
-            // 投稿が更新された場合、掲示板データを更新
-            ref.invalidate(bulletinPostsProvider);
-            ref.invalidate(pinnedBulletinPostsProvider);
-            ref.invalidate(popularBulletinPostsProvider);
-            ref.invalidate(bulletinPostsByCategoryProvider);
+            await _refreshBulletinFeed();
           }
         });
   }
@@ -1345,10 +1629,7 @@ class _BulletinScreenState extends ConsumerState<BulletinScreen> {
       }
 
       // データを更新
-      ref.invalidate(bulletinPostsProvider);
-      ref.invalidate(pinnedBulletinPostsProvider);
-      ref.invalidate(popularBulletinPostsProvider);
-      ref.invalidate(bulletinPostsByCategoryProvider);
+      await _refreshBulletinFeed();
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(

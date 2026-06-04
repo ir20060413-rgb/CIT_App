@@ -11,9 +11,11 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'core/theme/app_theme.dart';
+import 'widgets/common/ui_feedback_listener.dart';
 import 'core/config/app_router.dart';
 import 'core/constants/app_constants.dart';
 import 'core/providers/settings_provider.dart';
+import 'core/providers/auth_session_provider.dart';
 import 'core/providers/theme_provider.dart';
 import 'core/providers/simple_auth_provider.dart';
 import 'core/services/performance_monitor.dart';
@@ -315,7 +317,18 @@ void main() async {
   if (!kIsWeb) {
     try {
       final uri = await HomeWidget.initiallyLaunchedFromHomeWidget();
-      if (uri != null && uri.toString().contains('schedule')) {
+      if (uri != null && uri.toString().toLowerCase().contains('schedule')) {
+        initialRoute = '/home?tab=schedule';
+      }
+    } catch (_) {}
+
+    // Flutter Engine 経由で渡された defaultRouteName もチェックする
+    // (Android のホーム画面ウィジェットから cold start した時、
+    //  intent.data の `citapp://schedule` がここに渡るケースがある)
+    try {
+      final defaultRoute =
+          PlatformDispatcher.instance.defaultRouteName.toLowerCase();
+      if (defaultRoute.contains('schedule')) {
         initialRoute = '/home?tab=schedule';
       }
     } catch (_) {}
@@ -337,7 +350,7 @@ void _initializeBackgroundServices() {
   // 遅延実行でアプリ起動に影響しないように
   Future.delayed(const Duration(seconds: 2), () async {
     try {
-      // メニュー自動更新スケジューラーを開始
+      // メニュー自動更新（端末側タイマー）は MenuSchedulerService.scheduledUpdatesEnabled で制御
       MenuSchedulerService.startScheduledUpdates();
 
       // ホームウィジェット初期化
@@ -486,6 +499,7 @@ class _CITAppState extends ConsumerState<CITApp> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    ref.watch(authSessionSyncProvider);
     final router = ref.watch(routerProvider);
     final themeMode = ref.watch(themeModeProvider);
     final appFontSize = ref.watch(appFontSizeProvider);
@@ -503,7 +517,9 @@ class _CITAppState extends ConsumerState<CITApp> with WidgetsBindingObserver {
           data: mediaQuery.copyWith(
             textScaler: TextScaler.linear(appFontSize.textScale),
           ),
-          child: child ?? const SizedBox.shrink(),
+          child: UiFeedbackListener(
+            child: child ?? const SizedBox.shrink(),
+          ),
         );
       },
     );
