@@ -3,9 +3,9 @@
 # Idempotent: safe to run repeatedly and on a warm/snapshotted disk.
 set -euo pipefail
 
-# Flutter 3.29.0 corresponds to the revision pinned in .metadata
-# (35c388afb57ef061d06a39b537336c87e0e3d1b1, stable channel, Dart 3.7.0).
-FLUTTER_VERSION="3.29.0"
+# Flutter 3.38.3 (Dart 3.10.1) matches the README and the SDK constraint
+# recorded in pubspec.lock (flutter >=3.38.0, dart >=3.10.0).
+FLUTTER_VERSION="3.38.3"
 FLUTTER_DIR="${HOME}/flutter"
 
 # 1. Install the Flutter SDK if it is not already present on disk.
