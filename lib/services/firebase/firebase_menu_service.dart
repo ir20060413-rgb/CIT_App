@@ -1,7 +1,11 @@
+import 'package:cit_app/core/utils/logger.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+
+import 'storage_direct_url.dart';
+import 'storage_url_validator.dart';
 
 class FirebaseMenuService {
   static final _storage = FirebaseStorage.instance;
@@ -35,23 +39,25 @@ class FirebaseMenuService {
         existingNote = existingMeta.customMetadata?['note'];
       } catch (_) {}
 
+      final token = StorageDirectUrl.newDownloadToken();
       final metadata = SettableMetadata(
         contentType: 'image/png',
         customMetadata: {
           'campus': campusCode,
           'uploaded_at': DateTime.now().toIso8601String(),
           'uploaded_by': 'admin_manual_upload',
+          'firebaseStorageDownloadTokens': token,
           if (existingNote != null && existingNote.trim().isNotEmpty)
             'note': existingNote.trim(),
         },
       );
 
       await ref.putData(imageBytes, metadata);
-      final url = await ref.getDownloadURL();
-      debugPrint('✅ メニュー画像をアップロードしました: $campusCode → $url');
+      final url = StorageDirectUrl.mediaWithToken(ref.fullPath, token);
+      SecureLogger.debug('✅ メニュー画像をアップロードしました: $campusCode → $url');
       return url;
     } catch (e) {
-      debugPrint('❌ メニュー画像アップロード失敗: $e');
+      SecureLogger.debug('❌ メニュー画像アップロード失敗: $e');
       return null;
     }
   }
@@ -62,10 +68,10 @@ class FirebaseMenuService {
       final campusCode = _campusFileNames[campus] ?? campus;
       final ref = _storage.ref().child('$_menuImagesPath/$campusCode.png');
       await ref.delete();
-      debugPrint('🗑️ メニュー画像を削除しました: $campusCode');
+      SecureLogger.debug('🗑️ メニュー画像を削除しました: $campusCode');
       return true;
     } catch (e) {
-      debugPrint('❌ メニュー画像削除失敗: $e');
+      SecureLogger.debug('❌ メニュー画像削除失敗: $e');
       return false;
     }
   }
@@ -87,7 +93,10 @@ class FirebaseMenuService {
     try {
       final campusCode = _campusFileNames[campus] ?? campus;
       final doc =
-          await _firestore.collection(_menuNotesCollection).doc(campusCode).get();
+          await _firestore
+              .collection(_menuNotesCollection)
+              .doc(campusCode)
+              .get();
       final data = doc.data();
       final note = (data?['note'] as String?)?.trim();
       if (note != null && note.isNotEmpty) {
@@ -135,53 +144,62 @@ class FirebaseMenuService {
         } else {
           customMetadata['note'] = trimmedNote;
         }
-        await ref.updateMetadata(SettableMetadata(customMetadata: customMetadata));
+        await ref.updateMetadata(
+          SettableMetadata(customMetadata: customMetadata),
+        );
       } catch (_) {}
 
       return true;
     } catch (e) {
-      debugPrint('❌ 備考更新失敗: $e');
+      SecureLogger.debug('❌ 備考更新失敗: $e');
       return false;
     }
   }
 
-  /// Firebase Storage�̃_�E�����[�hURL��������Ȃ�`�F�b�N
+  /// 画像 URL が HTTP 上で取得可能か確認する。
   static Future<bool> isValidDownloadUrl(String url) async {
-    try {
-      final response = await http.head(Uri.parse(url)).timeout(_timeout);
-      return response.statusCode == 200;
-    } catch (e) {
-      debugPrint('FirebaseMenuService.isValidDownloadUrl: ���񂾃G���[ $e');
-      return false;
-    }
+    return StorageUrlValidator.isReachable(url);
   }
 
   /// メニュー画像をFirebase Storageから取得
   static Future<String?> getMenuImageUrl(String campus, DateTime date) async {
+    final fileName = _generateFileName(campus, date);
+    final storagePath = '$_menuImagesPath/$fileName';
+
+    final publicUrl = StorageDirectUrl.publicGcsUrl(storagePath);
+    if (await StorageUrlValidator.isReachable(publicUrl)) {
+      SecureLogger.debug('Firebase Storage 公開URL確認成功: $publicUrl');
+      return publicUrl;
+    }
+
     try {
-      final fileName = _generateFileName(campus, date);
-      debugPrint('Firebase Storage画像取得開始: fileName=$fileName');
-      final ref = _storage.ref().child('$_menuImagesPath/$fileName');
-
-      // まずファイルの存在確認
+      SecureLogger.debug('Firebase Storage画像取得開始: fileName=$fileName');
+      final ref = _storage.ref().child(storagePath);
       final metadata = await ref.getMetadata();
-      debugPrint('Firebase Storage ファイル存在確認成功: ${metadata.name}');
+      SecureLogger.debug('Firebase Storage ファイル存在確認成功: ${metadata.name}');
 
-      // Firebase Storage上の画像URLを取得
-      final downloadUrl = await ref.getDownloadURL();
-      debugPrint('Firebase Storage URL取得成功: $downloadUrl');
-
-      // URLが有効かテスト（簡単なHEADリクエスト）
-      final testResponse = await http.head(Uri.parse(downloadUrl));
-      if (testResponse.statusCode == 200) {
-        debugPrint('Firebase Storage URL確認成功: ${testResponse.statusCode}');
-        return downloadUrl;
-      } else {
-        debugPrint('Firebase Storage URL無効: ${testResponse.statusCode}');
-        throw Exception('URL無効: ${testResponse.statusCode}');
+      final token =
+          metadata.customMetadata?['firebaseStorageDownloadTokens']
+              ?.split(',')
+              .first
+              .trim();
+      if (token != null && token.isNotEmpty) {
+        final tokenUrl = StorageDirectUrl.mediaWithToken(ref.fullPath, token);
+        if (await StorageUrlValidator.isReachable(tokenUrl)) {
+          SecureLogger.debug('Firebase Storage トークンURL確認成功: $tokenUrl');
+          return tokenUrl;
+        }
       }
+
+      final downloadUrl = await ref.getDownloadURL();
+      SecureLogger.debug('Firebase Storage URL取得成功: $downloadUrl');
+      if (await StorageUrlValidator.isReachable(downloadUrl)) {
+        SecureLogger.debug('Firebase Storage URL確認成功');
+        return downloadUrl;
+      }
+      throw Exception('Firebase Storage URLが無効');
     } catch (e) {
-      debugPrint('Firebase Storage画像取得エラー: $e');
+      SecureLogger.debug('Firebase Storage画像取得エラー: $e');
 
       // Firebase Storageにない場合は、スクレイピングしてアップロード
       return await _scrapeAndUploadImage(campus, date);
@@ -194,11 +212,11 @@ class FirebaseMenuService {
     DateTime date,
   ) async {
     try {
-      debugPrint('メニュー画像をスクレイピング開始: $campus, $date');
+      SecureLogger.debug('メニュー画像をスクレイピング開始: $campus, $date');
 
       // 公式サイトのURL生成
       final sourceUrl = _generateSourceUrl(campus, date);
-      debugPrint('スクレイピング元URL: $sourceUrl');
+      SecureLogger.debug('スクレイピング元URL: $sourceUrl');
 
       // 画像をダウンロード
       final response = await http
@@ -209,45 +227,55 @@ class FirebaseMenuService {
           .timeout(_timeout);
 
       if (response.statusCode != 200) {
-        debugPrint('画像ダウンロード失敗: ${response.statusCode}');
+        SecureLogger.debug('画像ダウンロード失敗: ${response.statusCode}');
         return null;
       }
 
       final imageBytes = response.bodyBytes;
-      debugPrint('画像ダウンロード成功: ${imageBytes.length} bytes');
+      SecureLogger.debug('画像ダウンロード成功: ${imageBytes.length} bytes');
 
       // Firebase Storageにアップロード
       final fileName = _generateFileName(campus, date);
       final ref = _storage.ref().child('$_menuImagesPath/$fileName');
 
-      final metadata = SettableMetadata(
-        contentType: 'image/png',
-        customMetadata: {
-          'campus': campus,
-          'date': date.toIso8601String(),
-          'source_url': sourceUrl,
-          'scraped_at': DateTime.now().toIso8601String(),
-        },
-      );
+      try {
+        final token = StorageDirectUrl.newDownloadToken();
+        final uploadMetadata = SettableMetadata(
+          contentType: 'image/png',
+          customMetadata: {
+            'campus': campus,
+            'date': date.toIso8601String(),
+            'source_url': sourceUrl,
+            'scraped_at': DateTime.now().toIso8601String(),
+            'firebaseStorageDownloadTokens': token,
+          },
+        );
 
-      await ref.putData(imageBytes, metadata);
-      final downloadUrl = await ref.getDownloadURL();
+        await ref.putData(imageBytes, uploadMetadata);
+        final downloadUrl = StorageDirectUrl.mediaWithToken(
+          ref.fullPath,
+          token,
+        );
 
-      debugPrint('Firebase Storage保存成功: $downloadUrl');
-      return downloadUrl;
+        SecureLogger.debug('Firebase Storage保存成功: $downloadUrl');
+        return downloadUrl;
+      } catch (storageError) {
+        SecureLogger.debug('Firebase Storage保存失敗。公式URLを使用: $storageError');
+        return sourceUrl;
+      }
     } catch (e) {
-      debugPrint('画像スクレイピング・アップロードエラー: $e');
+      SecureLogger.debug('画像スクレイピング・アップロードエラー: $e');
       return null;
     }
   }
 
   /// 今週の全メニュー画像を更新（Firebase Functions等で定期実行）
   static Future<void> updateWeeklyMenuImages() async {
-    debugPrint('=== 週間メニュー画像更新開始 ===');
+    SecureLogger.debug('=== 週間メニュー画像更新開始 ===');
 
     for (final campus in _campusFileNames.keys) {
       try {
-        debugPrint('$campus キャンパスの画像更新開始');
+        SecureLogger.debug('$campus キャンパスの画像更新開始');
 
         // 今週の月曜日から金曜日まで
         final monday = _getMondayOfCurrentWeek();
@@ -259,19 +287,19 @@ class FirebaseMenuService {
           await Future.delayed(const Duration(seconds: 2));
         }
 
-        debugPrint('$campus キャンパスの画像更新完了');
+        SecureLogger.debug('$campus キャンパスの画像更新完了');
       } catch (e) {
-        debugPrint('$campus キャンパスの画像更新でエラー: $e');
+        SecureLogger.debug('$campus キャンパスの画像更新でエラー: $e');
       }
     }
 
-    debugPrint('=== 週間メニュー画像更新完了 ===');
+    SecureLogger.debug('=== 週間メニュー画像更新完了 ===');
   }
 
   /// 古い画像を削除（1週間以上前）
   static Future<void> cleanOldImages() async {
     try {
-      debugPrint('古いメニュー画像の削除開始');
+      SecureLogger.debug('古いメニュー画像の削除開始');
 
       final ref = _storage.ref().child(_menuImagesPath);
       final result = await ref.listAll();
@@ -287,15 +315,15 @@ class FirebaseMenuService {
             final scrapedAt = DateTime.parse(scrapedAtStr);
             if (scrapedAt.isBefore(oneWeekAgo)) {
               await item.delete();
-              debugPrint('古い画像を削除: ${item.name}');
+              SecureLogger.debug('古い画像を削除: ${item.name}');
             }
           }
         } catch (e) {
-          debugPrint('画像削除でエラー: ${item.name}, $e');
+          SecureLogger.debug('画像削除でエラー: ${item.name}, $e');
         }
       }
     } catch (e) {
-      debugPrint('古い画像削除でエラー: $e');
+      SecureLogger.debug('古い画像削除でエラー: $e');
     }
   }
 
@@ -322,7 +350,7 @@ class FirebaseMenuService {
             'custom_metadata': metadata.customMetadata,
           });
         } catch (e) {
-          debugPrint('画像情報取得エラー: ${item.name}, $e');
+          SecureLogger.debug('画像情報取得エラー: ${item.name}, $e');
         }
       }
 
@@ -334,10 +362,10 @@ class FirebaseMenuService {
         return bTime.compareTo(aTime);
       });
 
-      debugPrint('Firebase Storage上のメニュー画像: ${images.length}件');
+      SecureLogger.debug('Firebase Storage上のメニュー画像: ${images.length}件');
       return images;
     } catch (e) {
-      debugPrint('画像リスト取得エラー: $e');
+      SecureLogger.debug('画像リスト取得エラー: $e');
       return [];
     }
   }
@@ -349,7 +377,7 @@ class FirebaseMenuService {
     final campusCode = _campusFileNames[campus] ?? campus;
     final fileName = '$campusCode.png';
 
-    debugPrint(
+    SecureLogger.debug(
       'FirebaseMenuService._generateFileName: campus=$campus → fileName=$fileName',
     );
     return fileName;
@@ -370,49 +398,54 @@ class FirebaseMenuService {
 
   /// 今日のメニュー画像URL取得
   static Future<String?> getTodayMenuImageUrl(String campus) async {
-    debugPrint('FirebaseMenuService.getTodayMenuImageUrl: campus=$campus');
+    SecureLogger.debug('FirebaseMenuService.getTodayMenuImageUrl: campus=$campus');
 
     try {
       final result = await getMenuImageUrl(campus, DateTime.now());
-      debugPrint(
-        'FirebaseMenuService.getTodayMenuImageUrl: Firebase経由成功 result=$result',
-      );
-      return result;
+      if (result != null) {
+        SecureLogger.debug(
+          'FirebaseMenuService.getTodayMenuImageUrl: Firebase経由成功 result=$result',
+        );
+        return result;
+      }
+      SecureLogger.debug('FirebaseMenuService.getTodayMenuImageUrl: Firebase経由はnull');
     } catch (e) {
-      debugPrint('FirebaseMenuService.getTodayMenuImageUrl: Firebase経由失敗 $e');
-
-      // Web版では CORS制限のため直接アクセス不可
-      if (kIsWeb) {
-        debugPrint(
-          'FirebaseMenuService.getTodayMenuImageUrl: Web版のためCORS制限でFirebaseのみ利用可能',
-        );
-        return null;
-      }
-
-      // モバイル版のみ: 直接CIT公式サイトから取得を試みる
-      try {
-        final directUrl = _generateSourceUrl(campus, DateTime.now());
-        debugPrint(
-          'FirebaseMenuService.getTodayMenuImageUrl: モバイル版で直接URL試行 $directUrl',
-        );
-
-        final response = await http.head(Uri.parse(directUrl));
-        if (response.statusCode == 200) {
-          debugPrint('FirebaseMenuService.getTodayMenuImageUrl: 直接URL成功');
-          return directUrl;
-        } else {
-          debugPrint(
-            'FirebaseMenuService.getTodayMenuImageUrl: 直接URL失敗 ${response.statusCode}',
-          );
-        }
-      } catch (directError) {
-        debugPrint(
-          'FirebaseMenuService.getTodayMenuImageUrl: 直接URL例外 $directError',
-        );
-      }
+      SecureLogger.debug('FirebaseMenuService.getTodayMenuImageUrl: Firebase経由失敗 $e');
     }
 
-    debugPrint('FirebaseMenuService.getTodayMenuImageUrl: 全て失敗, null返却');
+    // Web版では CORS制限のため直接アクセス不可
+    if (kIsWeb) {
+      SecureLogger.debug(
+        'FirebaseMenuService.getTodayMenuImageUrl: Web版のためCORS制限でFirebaseのみ利用可能',
+      );
+      return null;
+    }
+
+    // モバイル版のみ: 直接CIT公式サイトから取得を試みる
+    try {
+      final directUrl = _generateSourceUrl(campus, DateTime.now());
+      SecureLogger.debug(
+        'FirebaseMenuService.getTodayMenuImageUrl: モバイル版で直接URL試行 $directUrl',
+      );
+
+      final response = await http
+          .get(Uri.parse(directUrl), headers: const {'Range': 'bytes=0-0'})
+          .timeout(_timeout);
+      if (response.statusCode == 200 || response.statusCode == 206) {
+        SecureLogger.debug('FirebaseMenuService.getTodayMenuImageUrl: 直接URL成功');
+        return directUrl;
+      } else {
+        SecureLogger.debug(
+          'FirebaseMenuService.getTodayMenuImageUrl: 直接URL失敗 ${response.statusCode}',
+        );
+      }
+    } catch (directError) {
+      SecureLogger.debug(
+        'FirebaseMenuService.getTodayMenuImageUrl: 直接URL例外 $directError',
+      );
+    }
+
+    SecureLogger.debug('FirebaseMenuService.getTodayMenuImageUrl: 全て失敗, null返却');
     return null;
   }
 
@@ -437,41 +470,41 @@ class FirebaseMenuService {
   /// Firebase Storage接続テスト
   static Future<bool> testConnection() async {
     try {
-      debugPrint('=== Firebase Storage接続テスト開始 ===');
-      debugPrint('Storage instance: $_storage');
+      SecureLogger.debug('=== Firebase Storage接続テスト開始 ===');
+      SecureLogger.debug('Storage instance: $_storage');
 
       // まず簡単な参照取得テスト
       final ref = _storage.ref().child('test/connection_test.txt');
-      debugPrint('Reference created: $ref');
+      SecureLogger.debug('Reference created: $ref');
 
       // 文字列をアップロード
-      debugPrint('Uploading test string...');
+      SecureLogger.debug('Uploading test string...');
       await ref.putString('Firebase Storage接続テスト: ${DateTime.now()}');
-      debugPrint('Upload successful');
+      SecureLogger.debug('Upload successful');
 
       // ダウンロードURL取得
-      debugPrint('Getting download URL...');
+      SecureLogger.debug('Getting download URL...');
       final downloadUrl = await ref.getDownloadURL();
-      debugPrint('Download URL: $downloadUrl');
+      SecureLogger.debug('Download URL: $downloadUrl');
 
       // テストファイル削除
-      debugPrint('Deleting test file...');
+      SecureLogger.debug('Deleting test file...');
       await ref.delete();
-      debugPrint('Test file deleted');
+      SecureLogger.debug('Test file deleted');
 
-      debugPrint('Firebase Storage接続テスト成功: $downloadUrl');
+      SecureLogger.debug('Firebase Storage接続テスト成功: $downloadUrl');
       return true;
     } catch (e, stackTrace) {
-      debugPrint('Firebase Storage接続テスト失敗: $e');
-      debugPrint('Stack trace: $stackTrace');
+      SecureLogger.debug('Firebase Storage接続テスト失敗: $e');
+      SecureLogger.debug('Stack trace: $stackTrace');
 
       // エラーの詳細分析
       if (e.toString().contains('storage/unauthorized')) {
-        debugPrint('権限エラー: Storage Rulesを確認してください');
+        SecureLogger.debug('権限エラー: Storage Rulesを確認してください');
       } else if (e.toString().contains('storage/unknown')) {
-        debugPrint('不明なエラー: Firebase設定を確認してください');
+        SecureLogger.debug('不明なエラー: Firebase設定を確認してください');
       } else if (e.toString().contains('network')) {
-        debugPrint('ネットワークエラー: インターネット接続を確認してください');
+        SecureLogger.debug('ネットワークエラー: インターネット接続を確認してください');
       }
 
       return false;
@@ -480,32 +513,43 @@ class FirebaseMenuService {
 
   /// バス時刻表画像URLを取得
   static Future<String?> getBusTimetableImageUrl() async {
+    const fileName = 'bus_timetable.png';
+    const storagePath = 'bus_timetable/$fileName';
+
+    final publicUrl = StorageDirectUrl.publicGcsUrl(storagePath);
+    if (await StorageUrlValidator.isReachable(publicUrl)) {
+      SecureLogger.debug('Firebase Storage バス時刻表公開URL確認成功: $publicUrl');
+      return publicUrl;
+    }
+
     try {
-      const fileName = 'bus_timetable.png';
-      debugPrint('Firebase Storage バス時刻表画像取得開始: fileName=$fileName');
-      final ref = _storage.ref().child('bus_timetable/$fileName');
-
-      // まずファイルの存在確認
+      SecureLogger.debug('Firebase Storage バス時刻表画像取得開始: fileName=$fileName');
+      final ref = _storage.ref().child(storagePath);
       final metadata = await ref.getMetadata();
-      debugPrint('Firebase Storage バス時刻表ファイル存在確認成功: ${metadata.name}');
+      SecureLogger.debug('Firebase Storage バス時刻表ファイル存在確認成功: ${metadata.name}');
 
-      // Firebase Storage上の画像URLを取得
-      final downloadUrl = await ref.getDownloadURL();
-      debugPrint('Firebase Storage バス時刻表URL取得成功: $downloadUrl');
-
-      // URLが有効かテスト（簡単なHEADリクエスト）
-      final testResponse = await http
-          .head(Uri.parse(downloadUrl))
-          .timeout(_timeout);
-      if (testResponse.statusCode == 200) {
-        debugPrint('Firebase Storage バス時刻表URL確認成功: ${testResponse.statusCode}');
-        return downloadUrl;
-      } else {
-        debugPrint('Firebase Storage バス時刻表URL無効: ${testResponse.statusCode}');
-        throw Exception('バス時刻表URL無効: ${testResponse.statusCode}');
+      final token =
+          metadata.customMetadata?['firebaseStorageDownloadTokens']
+              ?.split(',')
+              .first
+              .trim();
+      if (token != null && token.isNotEmpty) {
+        final tokenUrl = StorageDirectUrl.mediaWithToken(ref.fullPath, token);
+        if (await StorageUrlValidator.isReachable(tokenUrl)) {
+          SecureLogger.debug('Firebase Storage バス時刻表トークンURL確認成功: $tokenUrl');
+          return tokenUrl;
+        }
       }
+
+      final downloadUrl = await ref.getDownloadURL();
+      SecureLogger.debug('Firebase Storage バス時刻表URL取得成功: $downloadUrl');
+      if (await StorageUrlValidator.isReachable(downloadUrl)) {
+        SecureLogger.debug('Firebase Storage バス時刻表URL確認成功');
+        return downloadUrl;
+      }
+      throw Exception('バス時刻表URL無効');
     } catch (e) {
-      debugPrint('Firebase Storage バス時刻表画像取得エラー: $e');
+      SecureLogger.debug('Firebase Storage バス時刻表画像取得エラー: $e');
       return null;
     }
   }
@@ -514,7 +558,7 @@ class FirebaseMenuService {
   static Future<bool> uploadBusTimetableImage(Uint8List imageBytes) async {
     try {
       const fileName = 'bus_timetable.png';
-      debugPrint('Firebase Storage バス時刻表画像アップロード開始: fileName=$fileName');
+      SecureLogger.debug('Firebase Storage バス時刻表画像アップロード開始: fileName=$fileName');
 
       final ref = _storage.ref().child('bus_timetable/$fileName');
 
@@ -529,11 +573,11 @@ class FirebaseMenuService {
 
       // アップロード実行
       await ref.putData(imageBytes, metadata);
-      debugPrint('Firebase Storage バス時刻表画像アップロード完了');
+      SecureLogger.debug('Firebase Storage バス時刻表画像アップロード完了');
 
       return true;
     } catch (e) {
-      debugPrint('Firebase Storage バス時刻表画像アップロードエラー: $e');
+      SecureLogger.debug('Firebase Storage バス時刻表画像アップロードエラー: $e');
       return false;
     }
   }

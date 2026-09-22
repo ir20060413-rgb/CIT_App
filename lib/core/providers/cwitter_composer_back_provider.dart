@@ -1,6 +1,11 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
-typedef CwitterComposerBackHandler = Future<void> Function();
+/// コンポーザーの戻る/離脱処理。
+///
+/// 戻り値は「この後の画面遷移を続行してよいか」を表す。
+/// 破棄が確定した（または破棄するドラフトが無い）場合は true、
+/// ユーザーがキャンセルした、または投稿処理中などで離脱を止める場合は false。
+typedef CwitterComposerBackHandler = Future<bool> Function();
 
 class CwitterComposerBackGate {
   const CwitterComposerBackGate({
@@ -12,7 +17,8 @@ class CwitterComposerBackGate {
   final CwitterComposerBackHandler? handleBack;
 }
 
-class CwitterComposerBackGateNotifier extends Notifier<CwitterComposerBackGate> {
+class CwitterComposerBackGateNotifier
+    extends Notifier<CwitterComposerBackGate> {
   @override
   CwitterComposerBackGate build() => const CwitterComposerBackGate();
 
@@ -34,5 +40,5 @@ class CwitterComposerBackGateNotifier extends Notifier<CwitterComposerBackGate> 
 
 final cwitterComposerBackGateProvider =
     NotifierProvider<CwitterComposerBackGateNotifier, CwitterComposerBackGate>(
-  CwitterComposerBackGateNotifier.new,
-);
+      CwitterComposerBackGateNotifier.new,
+    );

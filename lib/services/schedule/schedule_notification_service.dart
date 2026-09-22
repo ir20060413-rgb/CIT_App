@@ -1,6 +1,6 @@
+import 'package:cit_app/core/utils/logger.dart';
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest_all.dart' as tz;
@@ -10,6 +10,8 @@ import '../../core/utils/period_time_resolver.dart';
 import '../../models/schedule/schedule_model.dart';
 import 'class_notification_payload.dart';
 import 'lecture_period_service.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import '../auth/session_work_guard.dart';
 
 /// 授業ローカル通知サービス。
 ///
@@ -34,6 +36,15 @@ class ScheduleNotificationService {
   static const String _channelName = '授業出席通知';
   static const String _channelDescription = '講義開始まもなくお知らせします';
 
+  /// FCM プッシュ（フォアグラウンド表示）/ 汎用通知用チャンネル。
+  ///
+  /// `AndroidManifest.xml` の
+  /// `com.google.firebase.messaging.default_notification_channel_id` と一致させ、
+  /// バックグラウンド/フォアグラウンドで同一チャンネルに集約する。
+  static const String _pushChannelId = 'default_channel';
+  static const String _pushChannelName = 'お知らせ';
+  static const String _pushChannelDescription = 'コメント・返信・いいね・運営からのお知らせなど';
+
   /// 通知 ID の名前空間。授業出席通知は `0x10000000` 以上に割り当て、
   /// 他のローカル通知 ID と衝突しないようにする。
   static const int _attendanceIdMin = 0x10000000;
@@ -54,6 +65,11 @@ class ScheduleNotificationService {
   /// アプリ完全終了状態から通知タップで起動された場合の payload を保持。
   static String? _pendingLaunchPayload;
 
+  static Future<void> clearSessionNotifications() async {
+    _pendingLaunchPayload = null;
+    if (_initialized) await _plugin.cancelAll();
+  }
+
   /// 起動時 payload を 1 度だけ取り出す。
   static String? consumePendingLaunchPayload() {
     final p = _pendingLaunchPayload;
@@ -68,8 +84,9 @@ class ScheduleNotificationService {
     tz.initializeTimeZones();
     tz.setLocalLocation(tz.getLocation('Asia/Tokyo'));
 
-    const androidSettings =
-        AndroidInitializationSettings('@mipmap/launcher_icon');
+    const androidSettings = AndroidInitializationSettings(
+      'ic_stat_notification',
+    );
     const iosSettings = DarwinInitializationSettings(
       requestAlertPermission: true,
       requestBadgePermission: true,
@@ -86,7 +103,8 @@ class ScheduleNotificationService {
       onDidReceiveNotificationResponse: (NotificationResponse response) {
         final payload = response.payload;
         if (payload != null && payload.isNotEmpty) {
-          debugPrint('🔔 通知タップ: $payload');
+          _pendingLaunchPayload = payload;
+          SecureLogger.debug('🔔 通知タップ: $payload');
           _tapStreamController.add(payload);
         }
       },
@@ -98,41 +116,119 @@ class ScheduleNotificationService {
       if (launchDetails?.didNotificationLaunchApp == true) {
         final payload = launchDetails?.notificationResponse?.payload;
         if (payload != null && payload.isNotEmpty) {
-          debugPrint('🔔 通知から起動: $payload');
+          SecureLogger.debug('🔔 通知から起動: $payload');
           _pendingLaunchPayload = payload;
         }
       }
     } catch (e) {
-      debugPrint('⚠️ getNotificationAppLaunchDetails 失敗: $e');
+      SecureLogger.debug('⚠️ getNotificationAppLaunchDetails 失敗: $e');
     }
 
-    await _plugin
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(
-          const AndroidNotificationChannel(
-            _channelId,
-            _channelName,
-            description: _channelDescription,
-            importance: Importance.high,
-          ),
-        );
+    final androidImpl =
+        _plugin
+            .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin
+            >();
+
+    await androidImpl?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _channelId,
+        _channelName,
+        description: _channelDescription,
+        importance: Importance.high,
+      ),
+    );
+
+    // FCM/汎用プッシュ用チャンネルもコードで明示作成する。
+    // OEM によっては manifest の default_channel 自動作成に頼ると
+    // 重要度や表示が安定しないため、ここで high importance に固定する。
+    await androidImpl?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _pushChannelId,
+        _pushChannelName,
+        description: _pushChannelDescription,
+        importance: Importance.high,
+      ),
+    );
 
     await _requestAndroidPermissions();
 
     _initialized = true;
-    debugPrint('✅ ScheduleNotificationService initialized');
+    SecureLogger.debug('✅ ScheduleNotificationService initialized');
+  }
+
+  /// FCM プッシュをフォアグラウンドで受信した際などに、その場で 1 件表示する。
+  ///
+  /// 授業通知 ID 範囲（[_attendanceIdMin] 以上）とは別の範囲を使い、
+  /// `cancelAllNotifications()`（授業通知のみ削除）の対象外にする。
+  /// 授業出席と区別した遷移情報を保持する。
+  static Future<void> showImmediateNotification({
+    required String title,
+    required String body,
+    String? payload,
+  }) async {
+    final generation = SessionWorkGuard.generation;
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+    bool stillCurrent() =>
+        SessionWorkGuard.isCurrent(generation) &&
+        userId != null &&
+        FirebaseAuth.instance.currentUser?.uid == userId;
+    if (!stillCurrent()) return;
+    if (!_initialized) {
+      await initialize();
+    }
+    if (!stillCurrent()) return;
+    if (title.trim().isEmpty && body.trim().isEmpty) return;
+
+    // attendance 範囲（>= _attendanceIdMin）と衝突しない ID を採番する。
+    final id = DateTime.now().millisecondsSinceEpoch.remainder(
+      _attendanceIdMin,
+    );
+
+    final details = NotificationDetails(
+      android: AndroidNotificationDetails(
+        _pushChannelId,
+        _pushChannelName,
+        channelDescription: _pushChannelDescription,
+        importance: Importance.high,
+        priority: Priority.high,
+        playSound: true,
+        enableVibration: true,
+        icon: 'ic_stat_notification',
+        styleInformation: BigTextStyleInformation(body),
+      ),
+      iOS: const DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+      ),
+    );
+
+    try {
+      await _plugin.show(
+        id,
+        title.isNotEmpty ? title : 'お知らせ',
+        body,
+        details,
+        payload: payload,
+      );
+    } catch (e) {
+      SecureLogger.debug('⚠️ フォアグラウンド通知の表示に失敗: $e');
+    }
   }
 
   static Future<void> _requestAndroidPermissions() async {
-    final androidImpl = _plugin.resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin>();
+    final androidImpl =
+        _plugin
+            .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin
+            >();
     if (androidImpl == null) return;
     try {
       final granted = await androidImpl.requestNotificationsPermission();
-      debugPrint('📱 Android 通知権限: ${granted == true ? "許可" : "拒否"}');
+      SecureLogger.debug('📱 Android 通知権限: ${granted == true ? "許可" : "拒否"}');
     } catch (e) {
-      debugPrint('⚠️ Android 通知権限リクエスト失敗: $e');
+      SecureLogger.debug('⚠️ Android 通知権限リクエスト失敗: $e');
     }
   }
 
@@ -156,9 +252,11 @@ class ScheduleNotificationService {
           cancelled++;
         }
       }
-      debugPrint('🗑️ 授業出席通知をキャンセル: $cancelled 件');
+      SecureLogger.debug('🗑️ 授業出席通知をキャンセル: $cancelled 件');
     } catch (e) {
-      debugPrint('⚠️ pendingNotificationRequests 取得失敗: $e。fallback: cancelAll');
+      SecureLogger.debug(
+        '⚠️ pendingNotificationRequests 取得失敗: $e。fallback: cancelAll',
+      );
       await _plugin.cancelAll();
     }
   }
@@ -172,9 +270,15 @@ class ScheduleNotificationService {
   /// - 連続講義は開始セルのみを通知対象とする。
   /// - 無効な period（1〜10 以外）は対象外。
   static Future<void> scheduleWeeklyNotifications(Schedule schedule) async {
+    final generation = SessionWorkGuard.generation;
+    bool isCurrent() =>
+        SessionWorkGuard.isCurrent(generation) &&
+        FirebaseAuth.instance.currentUser?.uid == schedule.userId;
+    if (!isCurrent()) return;
     if (!_initialized) {
       await initialize();
     }
+    if (!isCurrent()) return;
     await cancelAllNotifications();
 
     final now = DateTime.now();
@@ -183,13 +287,15 @@ class ScheduleNotificationService {
     int failed = 0;
     final scheduledList = <_ScheduledNotificationLog>[];
 
-    debugPrint('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    debugPrint('🔔 授業通知 予約処理開始');
-    debugPrint('   時間割: ${schedule.name ?? schedule.semester} (id=${schedule.id})');
-    debugPrint(
+    SecureLogger.debug('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    SecureLogger.debug('🔔 授業通知 予約処理開始');
+    SecureLogger.debug(
+      '   時間割: ${schedule.name ?? schedule.semester} (id=${schedule.id})',
+    );
+    SecureLogger.debug(
       '   対象期間: ${_formatDate(window.start)} 〜 ${_formatDate(window.end)}',
     );
-    debugPrint('   通知タイミング: 講義開始 $classNotificationBeforeMinutes 分前');
+    SecureLogger.debug('   通知タイミング: 講義開始 $classNotificationBeforeMinutes 分前');
 
     var targetDate = window.start;
     while (!targetDate.isAfter(window.end)) {
@@ -197,19 +303,25 @@ class ScheduleNotificationService {
       if (weekdayKey != null) {
         final daySchedule = schedule.timetable[weekdayKey];
         if (daySchedule != null) {
-          for (int period = PeriodTimeResolver.minPeriod;
-              period <= PeriodTimeResolver.maxPeriod;
-              period++) {
+          for (
+            int period = PeriodTimeResolver.minPeriod;
+            period <= PeriodTimeResolver.maxPeriod;
+            period++
+          ) {
             if (!PeriodTimeResolver.isValidPeriod(period)) continue;
             final scheduleClass = daySchedule[period];
             if (scheduleClass == null) continue;
             // 連続講義の中間セルは通知対象外（開始セルのみ通知）
             if (!scheduleClass.isStartCell) continue;
 
-            final startDateTime =
-                PeriodTimeResolver.startDateTimeFor(targetDate, period);
-            final endDateTime =
-                PeriodTimeResolver.endDateTimeFor(targetDate, period);
+            final startDateTime = PeriodTimeResolver.startDateTimeFor(
+              targetDate,
+              period,
+            );
+            final endDateTime = PeriodTimeResolver.endDateTimeFor(
+              targetDate,
+              period,
+            );
             if (startDateTime == null || endDateTime == null) continue;
 
             final notificationTime = startDateTime.subtract(
@@ -220,9 +332,10 @@ class ScheduleNotificationService {
               continue;
             }
 
-            final subjectName = scheduleClass.subjectName.trim().isNotEmpty
-                ? scheduleClass.subjectName.trim()
-                : '次の授業';
+            final subjectName =
+                scheduleClass.subjectName.trim().isNotEmpty
+                    ? scheduleClass.subjectName.trim()
+                    : '次の授業';
             final classroom = scheduleClass.classroom.trim();
 
             final payload = ClassNotificationPayload(
@@ -241,9 +354,10 @@ class ScheduleNotificationService {
             );
 
             const title = 'まもなく授業が始まります';
-            final body = classroom.isNotEmpty
-                ? 'まもなく「$subjectName」が始まります。教室：$classroom'
-                : 'まもなく「$subjectName」が始まります';
+            final body =
+                classroom.isNotEmpty
+                    ? 'まもなく「$subjectName」が始まります。教室：$classroom'
+                    : 'まもなく「$subjectName」が始まります';
 
             final notificationId = _attendanceNotificationIdFor(
               scheduleId: schedule.id,
@@ -252,6 +366,7 @@ class ScheduleNotificationService {
             );
 
             try {
+              if (!isCurrent()) return;
               await _plugin.zonedSchedule(
                 notificationId,
                 title,
@@ -274,8 +389,8 @@ class ScheduleNotificationService {
               );
             } catch (e) {
               failed++;
-              debugPrint(
-                '❌ 通知予約失敗: ${_formatDate(targetDate)} ${period}限 $subjectName / $e',
+              SecureLogger.debug(
+                '❌ 通知予約失敗: ${_formatDate(targetDate)} $period限 $subjectName / $e',
               );
             }
           }
@@ -288,18 +403,18 @@ class ScheduleNotificationService {
       (a, b) => a.notificationTime.compareTo(b.notificationTime),
     );
 
-    debugPrint(
+    SecureLogger.debug(
       '✅ 通知予約完了: 予約=${scheduledList.length}件 / スキップ(過去)=$skipped件 / 失敗=$failed件',
     );
     if (scheduledList.isEmpty) {
-      debugPrint('   予約された通知はありません（対象期間内に未来の講義なし）');
+      SecureLogger.debug('   予約された通知はありません（対象期間内に未来の講義なし）');
     } else {
-      debugPrint('   ── 予約済み通知一覧（通知時刻順） ──');
+      SecureLogger.debug('   ── 予約済み通知一覧（通知時刻順） ──');
       for (final entry in scheduledList) {
-        debugPrint('   ${entry.toLogLine()}');
+        SecureLogger.debug('   ${entry.toLogLine()}');
       }
     }
-    debugPrint('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    SecureLogger.debug('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   }
 
   static String _formatDate(DateTime d) {
@@ -319,7 +434,8 @@ class ScheduleNotificationService {
     try {
       final settings = await LecturePeriodService.getLecturePeriod();
       final isFall = schedule.semester.contains('後期');
-      final startRaw = isFall ? settings?.fallStartDate : settings?.springStartDate;
+      final startRaw =
+          isFall ? settings?.fallStartDate : settings?.springStartDate;
       final endRaw = isFall ? settings?.fallEndDate : settings?.springEndDate;
       final legacyStart = settings?.lectureStartDate;
       final legacyEnd = settings?.lectureEndDate;
@@ -337,7 +453,7 @@ class ScheduleNotificationService {
         }
       }
     } catch (e) {
-      debugPrint('⚠️ 講義期間設定の取得に失敗。fallbackで通知予約します: $e');
+      SecureLogger.debug('⚠️ 講義期間設定の取得に失敗。fallbackで通知予約します: $e');
     }
 
     return DateTimeRange(
@@ -390,7 +506,7 @@ class ScheduleNotificationService {
         priority: Priority.high,
         playSound: true,
         enableVibration: true,
-        icon: '@mipmap/launcher_icon',
+        icon: 'ic_stat_notification',
         styleInformation: BigTextStyleInformation(body),
       ),
       iOS: const DarwinNotificationDetails(
@@ -423,6 +539,6 @@ class _ScheduledNotificationLog {
     final notifyAt = ScheduleNotificationService._formatTime(notificationTime);
     final startAt = ScheduleNotificationService._formatTime(startDateTime);
     final classroomPart = classroom.isNotEmpty ? ' / 教室: $classroom' : '';
-    return '🔔 $dateStr  通知 $notifyAt  →  $startAt 開始  ${period}限「$subjectName」$classroomPart';
+    return '🔔 $dateStr  通知 $notifyAt  →  $startAt 開始  $period限「$subjectName」$classroomPart';
   }
 }

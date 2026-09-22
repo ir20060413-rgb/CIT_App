@@ -1,10 +1,10 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../../utils/community/post_image_utils.dart';
 import 'animated_image_placeholder.dart';
+import 'safe_cached_network_image.dart';
 
-/// 投稿画像用。GIF はアニメーション表示、それ以外はキャッシュ付き静止画。
+/// 投稿画像用（Cwitter / ちばちゃんねる等）。学食メニューと同じ URL 表示方式。
 class NetworkPostImage extends StatelessWidget {
   const NetworkPostImage({
     super.key,
@@ -35,19 +35,32 @@ class NetworkPostImage extends StatelessWidget {
           if (loadingProgress == null) return child;
           return placeholder ?? _defaultPlaceholder();
         },
-        errorBuilder: (context, error, stackTrace) =>
-            errorWidget ?? _defaultErrorWidget(),
+        errorBuilder:
+            (context, error, stackTrace) =>
+                errorWidget ?? _defaultErrorWidget(),
       );
     }
 
-    return CachedNetworkImage(
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    final cacheWidth = _cacheDimension(width, dpr);
+    final cacheHeight = _cacheDimension(height, dpr);
+
+    return SafeCachedNetworkImage(
       imageUrl: imageUrl,
       fit: fit,
       width: width,
       height: height,
-      placeholder: (_, __) => placeholder ?? _defaultPlaceholder(),
-      errorWidget: (_, __, ___) => errorWidget ?? _defaultErrorWidget(),
+      memCacheWidth: cacheWidth,
+      memCacheHeight: cacheHeight,
+      fadeInDuration: Duration.zero,
+      placeholder: placeholder ?? _defaultPlaceholder(),
+      errorWidget: errorWidget ?? _defaultErrorWidget(),
     );
+  }
+
+  int? _cacheDimension(double? logicalSize, double dpr) {
+    if (logicalSize == null || !logicalSize.isFinite) return null;
+    return (logicalSize * dpr).round().clamp(1, 1200);
   }
 
   Widget _defaultPlaceholder() {
@@ -99,24 +112,27 @@ class NetworkPostImageFullscreen extends StatelessWidget {
             borderColor: Colors.white24,
           );
         },
-        errorBuilder: (context, error, stackTrace) =>
-            errorWidget ?? const Icon(Icons.broken_image_outlined, color: Colors.white54),
+        errorBuilder:
+            (context, error, stackTrace) =>
+                errorWidget ??
+                const Icon(Icons.broken_image_outlined, color: Colors.white54),
       );
     }
 
-    return CachedNetworkImage(
+    return SafeCachedNetworkImage(
       imageUrl: imageUrl,
       width: double.infinity,
       height: double.infinity,
       fit: BoxFit.contain,
-      placeholder: (context, url) => const AnimatedImagePlaceholder(
+      placeholder: const AnimatedImagePlaceholder(
         width: 220,
         height: 220,
         borderRadius: 12,
         borderColor: Colors.white24,
       ),
-      errorWidget: (context, url, error) =>
-          errorWidget ?? const Icon(Icons.broken_image_outlined, color: Colors.white54),
+      errorWidget:
+          errorWidget ??
+          const Icon(Icons.broken_image_outlined, color: Colors.white54),
     );
   }
 }

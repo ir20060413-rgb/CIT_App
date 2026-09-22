@@ -1,11 +1,11 @@
+import '../core/theme/app_colors.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/foundation.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../core/providers/firebase_menu_provider.dart';
 import 'common/animated_image_placeholder.dart';
-import 'common/interactive_viewer_double_tap_zoom.dart';
+import 'common/safe_cached_network_image.dart';
 
 class FirebaseMenuImageWidget extends ConsumerWidget {
   final String campus;
@@ -63,7 +63,7 @@ class FirebaseMenuImageWidget extends ConsumerWidget {
       height: height,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.grey.shade300),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
       ),
       child: Stack(
         children: [
@@ -82,41 +82,17 @@ class FirebaseMenuImageWidget extends ConsumerWidget {
               transitionOnUserGestures: true,
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(8),
-                child:
-                    kIsWeb
-                        ? // Web版：Image.networkを使用（Firebase SDKでCORS解決済み）
-                        Image.network(
-                          imageUrl,
-                          width: width,
-                          height: height,
-                          fit: fit,
-                          loadingBuilder: (context, child, loadingProgress) {
-                            if (loadingProgress == null) return child;
-                            return _buildLoadingWidget(context);
-                          },
-                          errorBuilder: (context, error, stackTrace) {
-                            debugPrint('Firebase画像読み込みエラー: $error');
-                            debugPrint('StackTrace: $stackTrace');
-                            return _buildErrorWidget(
-                              context,
-                              'ネットワークエラー (Status: 0)',
-                            );
-                          },
-                        )
-                        : // モバイル版：CachedNetworkImageを使用
-                        CachedNetworkImage(
-                          imageUrl: imageUrl,
-                          width: width,
-                          height: height,
-                          fit: fit,
-                          placeholder:
-                              (context, url) => _buildLoadingWidget(context),
-                          errorWidget:
-                              (context, url, error) => _buildErrorWidget(
-                                context,
-                                'Firebase画像の読み込みエラー',
-                              ),
-                        ),
+                child: SafeCachedNetworkImage(
+                  imageUrl: imageUrl,
+                  width: width,
+                  height: height,
+                  fit: fit,
+                  placeholder: _buildLoadingWidget(context),
+                  errorWidget: _buildErrorWidget(
+                    context,
+                    kIsWeb ? 'ネットワークエラー' : 'Firebase画像の読み込みエラー',
+                  ),
+                ),
               ),
             ),
           ),
@@ -375,9 +351,10 @@ class _FullScreenMenuImageDialogState
       final translateX = viewportCenter.dx - (tapPosition.dx * newScale);
       final translateY = viewportCenter.dy - (tapPosition.dy * newScale);
 
-      controller.value = Matrix4.identity()
-        ..translate(translateX, translateY)
-        ..scale(newScale);
+      controller.value =
+          Matrix4.identity()
+            ..translate(translateX, translateY)
+            ..scale(newScale);
     }
   }
 
@@ -429,37 +406,38 @@ class _FullScreenMenuImageDialogState
 
     return Dialog.fullscreen(
       backgroundColor: Colors.black.withValues(alpha: opacity),
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onVerticalDragUpdate: _handleDragUpdate,
         onVerticalDragEnd: _handleDragEnd,
-            child: Transform.translate(
+        child: Transform.translate(
           offset: Offset(0, _dragOffset),
-              child: Transform.scale(
-                scale: dragScale,
-                child: Stack(
-                children: [
-                  Positioned.fill(
-                    child: PageView.builder(
+          child: Transform.scale(
+            scale: dragScale,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: PageView.builder(
                     controller: _pageController,
-                  physics: (_isImageZoomed || _isInteractingWithImage)
-                        ? const NeverScrollableScrollPhysics()
-                      : const PageScrollPhysics(),
+                    physics:
+                        (_isImageZoomed || _isInteractingWithImage)
+                            ? const NeverScrollableScrollPhysics()
+                            : const PageScrollPhysics(),
                     itemCount: campuses.length,
                     onPageChanged: _onPageChanged,
-                      itemBuilder: (context, index) {
-                        final campusId = campuses[index];
-                    return _buildCampusPage(context, campusId);
-                  },
+                    itemBuilder: (context, index) {
+                      final campusId = campuses[index];
+                      return _buildCampusPage(context, campusId);
+                    },
+                  ),
                 ),
-              ),
-              if (_showChrome) _buildTopControls(context),
-              if (_showChrome && _showHint && !_isImageZoomed)
-                _buildDoubleTapHint(context),
-              if (_showChrome) _buildCampusSelector(context),
-            ],
+                if (_showChrome) _buildTopControls(context),
+                if (_showChrome && _showHint && !_isImageZoomed)
+                  _buildDoubleTapHint(context),
+                if (_showChrome) _buildCampusSelector(context),
+              ],
+            ),
           ),
-        ),
         ),
       ),
     );
@@ -468,53 +446,29 @@ class _FullScreenMenuImageDialogState
   Widget _buildCampusPage(BuildContext context, String campusId) {
     final imageAsync = ref.watch(firebaseTodayMenuProvider(campusId));
 
-                        return imageAsync.when(
+    return imageAsync.when(
       data: (imageUrl) {
         if (imageUrl == null || imageUrl.isEmpty) {
           return _buildMessage(context, 'この食堂のメニュー画像は登録されていません');
         }
 
-        final imageWidget = kIsWeb
-            ? Image.network(
-                imageUrl,
-                width: double.infinity,
-                height: double.infinity,
-                fit: BoxFit.contain,
-                loadingBuilder: (context, child, loadingProgress) {
-                  if (loadingProgress == null) return child;
-                  return const AnimatedImagePlaceholder(
-                    width: 220,
-                    height: 220,
-                    borderRadius: 12,
-                    borderColor: Colors.white24,
-                  );
-                },
-                errorBuilder:
-                    (context, error, stackTrace) => _buildMessage(
-                      context,
-                      'メニュー画像の読み込みに失敗しました',
-                      icon: Icons.error_outline,
-                    ),
-              )
-            : CachedNetworkImage(
-                            imageUrl: imageUrl,
-                width: double.infinity,
-                height: double.infinity,
-                fit: BoxFit.contain,
-                placeholder:
-                    (context, url) => const AnimatedImagePlaceholder(
-                      width: 220,
-                      height: 220,
-                      borderRadius: 12,
-                      borderColor: Colors.white24,
-                          ),
-                errorWidget:
-                    (context, url, error) => _buildMessage(
-                            context,
-                      'メニュー画像の読み込みに失敗しました',
-                            icon: Icons.error_outline,
-                          ),
-                        );
+        final imageWidget = SafeCachedNetworkImage(
+          imageUrl: imageUrl,
+          width: double.infinity,
+          height: double.infinity,
+          fit: BoxFit.contain,
+          placeholder: const AnimatedImagePlaceholder(
+            width: 220,
+            height: 220,
+            borderRadius: 12,
+            borderColor: Colors.white24,
+          ),
+          errorWidget: _buildMessage(
+            context,
+            'メニュー画像の読み込みに失敗しました',
+            icon: Icons.error_outline,
+          ),
+        );
 
         return LayoutBuilder(
           builder: (context, constraints) {
@@ -566,7 +520,7 @@ class _FullScreenMenuImageDialogState
             context,
             '画像の読み込みに失敗しました',
             icon: Icons.error_outline,
-      ),
+          ),
     );
   }
 
@@ -607,8 +561,8 @@ class _FullScreenMenuImageDialogState
           borderRadius: BorderRadius.circular(20),
         ),
         child: IconButton(
-        icon: const Icon(Icons.close, color: Colors.white),
-        onPressed: () => Navigator.of(context).pop(),
+          icon: const Icon(Icons.close, color: Colors.white),
+          onPressed: () => Navigator.of(context).pop(),
         ),
       ),
     );
@@ -617,40 +571,44 @@ class _FullScreenMenuImageDialogState
   Widget _buildCampusSelector(BuildContext context) {
     final bottomPadding = MediaQuery.of(context).padding.bottom;
     final entries = widget.campusOptions.entries.toList();
-    final campusChips = entries.map((entry) {
-      final selected = entry.key == _currentCampus;
-      return ChoiceChip(
-        label: Text(
-          entry.value,
-          style: TextStyle(
-            color:
-                selected ? Colors.white : Colors.white.withValues(alpha: 0.85),
-            fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-          ),
-        ),
-        selected: selected,
-        onSelected: (_) {
-          final targetIndex = entries.indexWhere((e) => e.key == entry.key);
-          if (targetIndex != -1) {
-            setState(() => _currentCampus = entry.key);
-            if (_pageController.hasClients) {
-              _pageController.animateToPage(
-                targetIndex,
-                duration: const Duration(milliseconds: 250),
-                curve: Curves.easeInOut,
-              );
-            }
-          }
-        },
-        selectedColor: Theme.of(context).colorScheme.primary,
-        backgroundColor: Colors.black54,
-        surfaceTintColor: Colors.transparent,
-        side: selected
-            ? null
-            : BorderSide(color: Colors.white.withValues(alpha: 0.35)),
-        showCheckmark: false,
-      );
-    }).toList();
+    final campusChips =
+        entries.map((entry) {
+          final selected = entry.key == _currentCampus;
+          return ChoiceChip(
+            label: Text(
+              entry.value,
+              style: TextStyle(
+                color:
+                    selected
+                        ? Colors.white
+                        : Colors.white.withValues(alpha: 0.85),
+                fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+              ),
+            ),
+            selected: selected,
+            onSelected: (_) {
+              final targetIndex = entries.indexWhere((e) => e.key == entry.key);
+              if (targetIndex != -1) {
+                setState(() => _currentCampus = entry.key);
+                if (_pageController.hasClients) {
+                  _pageController.animateToPage(
+                    targetIndex,
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeInOut,
+                  );
+                }
+              }
+            },
+            selectedColor: Theme.of(context).colorScheme.primary,
+            backgroundColor: Colors.black54,
+            surfaceTintColor: Colors.transparent,
+            side:
+                selected
+                    ? null
+                    : BorderSide(color: Colors.white.withValues(alpha: 0.35)),
+            showCheckmark: false,
+          );
+        }).toList();
 
     return Positioned(
       left: 16,
@@ -762,14 +720,14 @@ class FirebaseWeeklyMenuWidget extends ConsumerWidget {
                             color:
                                 isToday
                                     ? Theme.of(context).colorScheme.primary
-                                    : Colors.grey.shade200,
+                                    : Theme.of(context).colorScheme.surfaceContainerHighest,
                             borderRadius: BorderRadius.circular(4),
                           ),
                           child: Text(
                             '${_getWeekdayName(date)}曜日',
                             style: TextStyle(
                               fontSize: 12,
-                              color: isToday ? Colors.white : Colors.black87,
+                              color: isToday ? Theme.of(context).colorScheme.onPrimary : Theme.of(context).colorScheme.onSurface,
                               fontWeight:
                                   isToday ? FontWeight.bold : FontWeight.normal,
                             ),
@@ -787,96 +745,41 @@ class FirebaseWeeklyMenuWidget extends ConsumerWidget {
                                         ),
                                     child: ClipRRect(
                                       borderRadius: BorderRadius.circular(6),
-                                      child:
-                                          kIsWeb
-                                              ? Image.network(
-                                                imageUrl,
-                                                width: 100,
-                                                height: 80,
-                                                fit: BoxFit.cover,
-                                                loadingBuilder: (
-                                                  context,
-                                                  child,
-                                                  loadingProgress,
-                                                ) {
-                                                  if (loadingProgress == null)
-                                                    return child;
-                                                  return Container(
-                                                    color: Colors.grey.shade200,
-                                                    child: const Center(
-                                                      child:
-                                                          CircularProgressIndicator(
-                                                            strokeWidth: 2,
-                                                          ),
-                                                    ),
-                                                  );
-                                                },
-                                                errorBuilder:
-                                                    (
-                                                      context,
-                                                      error,
-                                                      stackTrace,
-                                                    ) => Container(
-                                                      color:
-                                                          Colors.grey.shade100,
-                                                      child: Icon(
-                                                        Icons
-                                                            .image_not_supported,
-                                                        color:
-                                                            Colors
-                                                                .grey
-                                                                .shade400,
-                                                      ),
-                                                    ),
-                                              )
-                                              : CachedNetworkImage(
-                                                imageUrl: imageUrl,
-                                                width: 100,
-                                                height: 80,
-                                                fit: BoxFit.cover,
-                                                placeholder:
-                                                    (context, url) => Container(
-                                                      color:
-                                                          Colors.grey.shade200,
-                                                      child: const Center(
-                                                        child:
-                                                            CircularProgressIndicator(
-                                                              strokeWidth: 2,
-                                                            ),
-                                                      ),
-                                                    ),
-                                                errorWidget:
-                                                    (
-                                                      context,
-                                                      url,
-                                                      error,
-                                                    ) => Container(
-                                                      color:
-                                                          Colors.grey.shade100,
-                                                      child: Icon(
-                                                        Icons
-                                                            .image_not_supported,
-                                                        color:
-                                                            Colors
-                                                                .grey
-                                                                .shade400,
-                                                      ),
-                                                    ),
-                                              ),
+                                      child: SafeCachedNetworkImage(
+                                        imageUrl: imageUrl,
+                                        width: 100,
+                                        height: 80,
+                                        fit: BoxFit.cover,
+                                        placeholder: Container(
+                                          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                                          child: const Center(
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          ),
+                                        ),
+                                        errorWidget: Container(
+                                          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                                          child: Icon(
+                                            Icons.image_not_supported,
+                                            color: Theme.of(context).colorScheme.onSurfaceVariant,
+                                          ),
+                                        ),
+                                      ),
                                     ),
                                   )
                                   : Container(
                                     decoration: BoxDecoration(
-                                      color: Colors.grey.shade100,
+                                      color: Theme.of(context).colorScheme.surfaceContainerHighest,
                                       borderRadius: BorderRadius.circular(6),
                                       border: Border.all(
-                                        color: Colors.grey.shade300,
+                                        color: Theme.of(context).colorScheme.outlineVariant,
                                       ),
                                     ),
                                     child: Center(
                                       child: Icon(
                                         Icons.image_not_supported,
-                                        color: Colors.grey.shade400,
+                                        color: Theme.of(context).colorScheme.onSurfaceVariant,
                                       ),
                                     ),
                                   ),
@@ -896,7 +799,7 @@ class FirebaseWeeklyMenuWidget extends ConsumerWidget {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const Icon(Icons.error, color: Colors.red),
+                 Icon(Icons.error, color: AppColors.accent(context, Colors.red)),
                 const SizedBox(height: 8),
                 Text('週間メニューの読み込みに失敗しました: $error'),
                 TextButton(
@@ -994,9 +897,10 @@ class _SingleImageFullScreenDialogState
       final translateX = viewportCenter.dx - (tapPosition.dx * newScale);
       final translateY = viewportCenter.dy - (tapPosition.dy * newScale);
 
-      _transformationController.value = Matrix4.identity()
-        ..translate(translateX, translateY)
-        ..scale(newScale);
+      _transformationController.value =
+          Matrix4.identity()
+            ..translate(translateX, translateY)
+            ..scale(newScale);
     }
   }
 
@@ -1025,134 +929,109 @@ class _SingleImageFullScreenDialogState
     final opacity = (1 - (_dragOffset / 360)).clamp(0.32, 1.0).toDouble();
     final dragScale = (1 - (_dragOffset / 1400)).clamp(0.9, 1.0).toDouble();
 
-    final imageWidget = kIsWeb
-        ? Image.network(
-            widget.imageUrl,
-            width: double.infinity,
-            height: double.infinity,
-            fit: BoxFit.contain,
-            loadingBuilder: (context, child, loadingProgress) {
-              if (loadingProgress == null) return child;
-              return const AnimatedImagePlaceholder(
-                width: 220,
-                height: 220,
-                borderRadius: 12,
-                borderColor: Colors.white24,
-              );
-            },
-            errorBuilder:
-                (context, error, stackTrace) => const Center(
-                  child: Icon(
-                    Icons.broken_image,
-                    color: Colors.white70,
-                    size: 48,
-                  ),
-                ),
-          )
-        : CachedNetworkImage(
-            imageUrl: widget.imageUrl,
-            width: double.infinity,
-            height: double.infinity,
-            fit: BoxFit.contain,
-            placeholder:
-                (context, url) => const AnimatedImagePlaceholder(
-                  width: 220,
-                  height: 220,
-                  borderRadius: 12,
-                  borderColor: Colors.white24,
-                ),
-            errorWidget:
-                (context, url, error) => const Center(
-                  child: Icon(
-                    Icons.broken_image,
-                    color: Colors.white70,
-                    size: 48,
-                  ),
-                ),
-          );
+    final imageWidget = SafeCachedNetworkImage(
+      imageUrl: widget.imageUrl,
+      width: double.infinity,
+      height: double.infinity,
+      fit: BoxFit.contain,
+      placeholder: const AnimatedImagePlaceholder(
+        width: 220,
+        height: 220,
+        borderRadius: 12,
+        borderColor: Colors.white24,
+      ),
+      errorWidget: const Center(
+        child: Icon(Icons.broken_image, color: Colors.white70, size: 48),
+      ),
+    );
 
     return Dialog.fullscreen(
       backgroundColor: Colors.black.withValues(alpha: opacity),
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onVerticalDragUpdate: _handleDragUpdate,
         onVerticalDragEnd: _handleDragEnd,
-            child: Transform.translate(
+        child: Transform.translate(
           offset: Offset(0, _dragOffset),
-              child: Transform.scale(
-                scale: dragScale,
-                child: Stack(
-                children: [
-              Positioned.fill(
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    return Material(
-                      color: Colors.transparent,
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.translucent,
-                        onTap:
-                            () => setState(() => _showChrome = !_showChrome),
-                        onDoubleTapDown:
-                            (details) =>
-                                _handleDoubleTap(details, constraints.biggest),
-                        child: InteractiveViewer(
-                          transformationController: _transformationController,
-                          minScale: 0.5,
-                          maxScale: 4.0,
-                          panEnabled: _isImageZoomed,
-                          child: SizedBox.expand(child: imageWidget),
+          child: Transform.scale(
+            scale: dragScale,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      return Material(
+                        color: Colors.transparent,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onTap:
+                              () => setState(() => _showChrome = !_showChrome),
+                          onDoubleTapDown:
+                              (details) => _handleDoubleTap(
+                                details,
+                                constraints.biggest,
+                              ),
+                          child: InteractiveViewer(
+                            transformationController: _transformationController,
+                            minScale: 0.5,
+                            maxScale: 4.0,
+                            panEnabled: _isImageZoomed,
+                            child: SizedBox.expand(child: imageWidget),
+                          ),
                         ),
+                      );
+                    },
+                  ),
+                ),
+                // 閉じるボタン
+                if (_showChrome)
+                  Positioned(
+                    top: MediaQuery.of(context).padding.top + 8,
+                    right: 16,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(20),
                       ),
-                    );
-                  },
-                ),
-              ),
-              // 閉じるボタン
-              if (_showChrome)
-                Positioned(
-                top: MediaQuery.of(context).padding.top + 8,
-                right: 16,
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(20),
+                      child: IconButton(
+                        icon: const Icon(Icons.close, color: Colors.white),
+                        onPressed: () => Navigator.of(context).pop(),
+                      ),
+                    ),
                   ),
-                  child: IconButton(
-                  icon: const Icon(Icons.close, color: Colors.white),
-                  onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ),
-              ),
-              // ヒント
-              if (_showChrome && _showHint && !_isImageZoomed)
-                Positioned(
-                  bottom: MediaQuery.of(context).padding.bottom + 24,
-                  left: 16,
-                  right: 16,
-                  child: Center(
-                    child: AnimatedOpacity(
-                      opacity: _showHint ? 1.0 : 0.0,
-                      duration: const Duration(milliseconds: 300),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.6),
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: const Text(
-                          'ダブルタップで拡大・縮小、ドラッグで移動できます',
-                          style: TextStyle(color: Colors.white70, fontSize: 12),
+                // ヒント
+                if (_showChrome && _showHint && !_isImageZoomed)
+                  Positioned(
+                    bottom: MediaQuery.of(context).padding.bottom + 24,
+                    left: 16,
+                    right: 16,
+                    child: Center(
+                      child: AnimatedOpacity(
+                        opacity: _showHint ? 1.0 : 0.0,
+                        duration: const Duration(milliseconds: 300),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.6),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: const Text(
+                            'ダブルタップで拡大・縮小、ドラッグで移動できます',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
-        ),
         ),
       ),
     );

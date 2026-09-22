@@ -1,5 +1,7 @@
-import 'package:cached_network_image/cached_network_image.dart';
+import '../../core/theme/app_colors.dart';
 import 'package:flutter/material.dart';
+
+import '../common/firebase_storage_image.dart';
 
 /// プロフィール表示用アバター（画像 or 頭文字）
 class UserAvatar extends StatelessWidget {
@@ -19,9 +21,7 @@ class UserAvatar extends StatelessWidget {
   final TextStyle? initialTextStyle;
 
   int get _colorValue {
-    final seed = (colorSeed?.isNotEmpty == true)
-        ? colorSeed!
-        : displayName;
+    final seed = (colorSeed?.isNotEmpty == true) ? colorSeed! : displayName;
     return seed.codeUnits.fold<int>(0, (a, b) => a + b) | 0xFF4CAF50;
   }
 
@@ -34,38 +34,40 @@ class UserAvatar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = Color(_colorValue);
+    final background = AppColors.tintedSurface(context, color);
+    final foreground = AppColors.ensureContrast(color, background);
     final url = imageUrl?.trim();
 
     if (url != null && url.isNotEmpty) {
       return CircleAvatar(
         radius: radius,
-        backgroundColor: color.withValues(alpha: 0.15),
+        backgroundColor: background,
         child: ClipOval(
-          child: CachedNetworkImage(
+          child: FirebaseStorageImage(
+            imageUrl: url,
             width: radius * 2,
             height: radius * 2,
-            imageUrl: url,
             fit: BoxFit.cover,
-            placeholder: (_, __) => Center(
+            placeholder: Center(
               child: Text(
                 _initial,
                 style: TextStyle(
                   fontSize: radius * 0.8,
-                  color: color,
+                  color: foreground,
                   fontWeight: FontWeight.bold,
                 ),
               ),
             ),
-            errorWidget: (_, __, ___) => Container(
+            errorWidget: Container(
               width: radius * 2,
               height: radius * 2,
-              color: color.withValues(alpha: 0.2),
+              color: background,
               alignment: Alignment.center,
               child: Text(
                 _initial,
                 style: TextStyle(
                   fontSize: radius * 0.8,
-                  color: color,
+                  color: foreground,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -77,13 +79,14 @@ class UserAvatar extends StatelessWidget {
 
     return CircleAvatar(
       radius: radius,
-      backgroundColor: color.withValues(alpha: 0.2),
+      backgroundColor: background,
       child: Text(
         _initial,
-        style: initialTextStyle ??
+        style:
+            initialTextStyle?.copyWith(color: foreground) ??
             TextStyle(
               fontSize: radius * 0.8,
-              color: color,
+              color: foreground,
               fontWeight: FontWeight.bold,
             ),
       ),

@@ -1,3 +1,4 @@
+import '../../../core/theme/app_colors.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
@@ -25,6 +26,7 @@ import 'cwitter_profile_setup_dialog.dart';
 import 'cwitter_social_links_section.dart';
 import 'cwitter_follow_list_screen.dart';
 import 'cwitter_handle_text.dart';
+import 'cwitter_hashtag_users_screen.dart';
 import '../../../models/community/cwitter_follow_user.dart';
 import 'cwitter_follow_feedback.dart';
 import 'cwitter_more_menu.dart';
@@ -81,7 +83,9 @@ class _CwitterProfileScreenState extends ConsumerState<CwitterProfileScreen>
     ref.read(cwitterLikeOverrideProvider.notifier).syncWithPosts(posts, uid);
   }
 
-  void _syncLikeOverridesFromActivities(List<CwitterProfileActivity> activities) {
+  void _syncLikeOverridesFromActivities(
+    List<CwitterProfileActivity> activities,
+  ) {
     final posts = <CwitterPost>[];
     for (final activity in activities) {
       if (activity.post != null) {
@@ -116,9 +120,10 @@ class _CwitterProfileScreenState extends ConsumerState<CwitterProfileScreen>
 
     final resolvedProfileName = resolveAuthorDisplayName(
       ref.watch(
-        authorDisplayNameProvider(
-          (authorId: profileUser.authorId, fallback: profileUser.displayName),
-        ),
+        authorDisplayNameProvider((
+          authorId: profileUser.authorId,
+          fallback: profileUser.displayName,
+        )),
       ),
       profileUser.displayName,
     );
@@ -130,8 +135,9 @@ class _CwitterProfileScreenState extends ConsumerState<CwitterProfileScreen>
     final showLikesTab = isSelf;
     _syncTabController(showLikesTab);
 
-    final activityProvider =
-        filteredCwitterUserActivityProvider(profileUser.authorId);
+    final activityProvider = filteredCwitterUserActivityProvider(
+      profileUser.authorId,
+    );
 
     ref.listen<AsyncValue<List<CwitterProfileActivity>>>(activityProvider, (
       _,
@@ -140,17 +146,15 @@ class _CwitterProfileScreenState extends ConsumerState<CwitterProfileScreen>
       next.whenData(_syncLikeOverridesFromActivities);
     });
     if (showLikesTab) {
-      ref.listen<AsyncValue<List<CwitterPost>>>(filteredLikedCwitterPostsProvider, (
-        _,
-        next,
-      ) {
-        next.whenData(_syncLikeOverrides);
-      });
+      ref.listen<AsyncValue<List<CwitterPost>>>(
+        filteredLikedCwitterPostsProvider,
+        (_, next) {
+          next.whenData(_syncLikeOverrides);
+        },
+      );
     }
 
-    final appBarTitle = isMyPage && isSelf
-        ? 'マイページ'
-        : resolvedProfileName;
+    final appBarTitle = isMyPage && isSelf ? 'マイページ' : resolvedProfileName;
 
     final blockedUsers = ref.watch(blockedUsersProvider).valueOrNull ?? [];
     final blockedByMe = blockedUsers.any(
@@ -169,28 +173,31 @@ class _CwitterProfileScreenState extends ConsumerState<CwitterProfileScreen>
                 isOwner: false,
                 iconSize: 24,
                 constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
-                onReport: () => showCwitterUserReportDialog(
-                  context,
-                  authorId: profileUser.authorId,
-                  displayName: profileUser.displayName,
-                  cwitterId: profileUser.cwitterId,
-                ),
-                onBlock: blockedByMe
-                    ? null
-                    : () async {
-                        final blocked = await showBlockConfirmationDialog(
-                          context,
-                          blockedUserId: profileUser.authorId,
-                          blockedUserName: profileUser.displayName,
-                          blockedUserCwitterId: profileUser.cwitterId,
-                        );
-                        if (blocked == true && context.mounted) {
-                          Navigator.of(context).pop();
-                        }
-                      },
-                onBan: !ref.watch(isAdminProvider)
-                    ? null
-                    : () => showAdminBanDialog(
+                onReport:
+                    () => showCwitterUserReportDialog(
+                      context,
+                      authorId: profileUser.authorId,
+                      displayName: profileUser.displayName,
+                      cwitterId: profileUser.cwitterId,
+                    ),
+                onBlock:
+                    blockedByMe
+                        ? null
+                        : () async {
+                          final blocked = await showBlockConfirmationDialog(
+                            context,
+                            blockedUserId: profileUser.authorId,
+                            blockedUserName: profileUser.displayName,
+                            blockedUserCwitterId: profileUser.cwitterId,
+                          );
+                          if (blocked == true && context.mounted) {
+                            Navigator.of(context).pop();
+                          }
+                        },
+                onBan:
+                    !ref.watch(isAdminProvider)
+                        ? null
+                        : () => showAdminBanDialog(
                           context,
                           targetUserId: profileUser.authorId,
                           targetLabel: '@${profileUser.cwitterId}',
@@ -218,57 +225,66 @@ class _CwitterProfileScreenState extends ConsumerState<CwitterProfileScreen>
                     controller: _tabController,
                     indicatorColor: const Color(0xFF4CAF50),
                     labelColor: const Color(0xFF2E7D32),
-                    unselectedLabelColor:
-                        colorScheme.onSurface.withValues(alpha: 0.6),
-                    tabs: const [
-                      Tab(text: 'Cweet'),
-                      Tab(text: 'いいね'),
-                    ],
+                    unselectedLabelColor: colorScheme.onSurface.withValues(
+                      alpha: 0.6,
+                    ),
+                    tabs: const [Tab(text: 'Cweet'), Tab(text: 'いいね')],
                   ),
                   backgroundColor: colorScheme.surface,
                 ),
               ),
           ];
         },
-        body: showLikesTab
-            ? TabBarView(
-                controller: _tabController,
-                children: [
-                  _ActivityTab(
-                    provider: activityProvider,
-                    emptyMessage: 'まだCweet・返信・recweetがありません',
-                    onRefresh: () async {
-                      ref.invalidate(cwitterUserActivityProvider(profileUser.authorId));
-                      ref.invalidate(filteredCwitterUserActivityProvider(profileUser.authorId));
-                      await ref.read(cwitterUserActivityProvider(profileUser.authorId).future);
-                    },
-                  ),
-                  _PostsTab(
-                    provider: filteredLikedCwitterPostsProvider,
-                    emptyMessage: 'いいねしたCweetはありません',
-                    onRefresh: () async {
-                      ref.invalidate(likedCwitterPostsProvider);
-                      ref.invalidate(filteredLikedCwitterPostsProvider);
-                      await ref.read(likedCwitterPostsProvider.future);
-                    },
-                  ),
-                ],
-              )
-            : _ActivityTab(
-                provider: activityProvider,
-                emptyMessage: 'まだCweet・返信・recweetがありません',
-                onRefresh: () async {
-                  ref.invalidate(
-                    cwitterUserActivityProvider(profileUser.authorId),
-                  );
-                  ref.invalidate(
-                    filteredCwitterUserActivityProvider(profileUser.authorId),
-                  );
-                  await ref.read(
-                    cwitterUserActivityProvider(profileUser.authorId).future,
-                  );
-                },
-              ),
+        body:
+            showLikesTab
+                ? TabBarView(
+                  controller: _tabController,
+                  children: [
+                    _ActivityTab(
+                      provider: activityProvider,
+                      emptyMessage: 'まだCweet・返信・recweetがありません',
+                      onRefresh: () async {
+                        ref.invalidate(
+                          cwitterUserActivityProvider(profileUser.authorId),
+                        );
+                        ref.invalidate(
+                          filteredCwitterUserActivityProvider(
+                            profileUser.authorId,
+                          ),
+                        );
+                        await ref.read(
+                          cwitterUserActivityProvider(
+                            profileUser.authorId,
+                          ).future,
+                        );
+                      },
+                    ),
+                    _PostsTab(
+                      provider: filteredLikedCwitterPostsProvider,
+                      emptyMessage: 'いいねしたCweetはありません',
+                      onRefresh: () async {
+                        ref.invalidate(likedCwitterPostsProvider);
+                        ref.invalidate(filteredLikedCwitterPostsProvider);
+                        await ref.read(likedCwitterPostsProvider.future);
+                      },
+                    ),
+                  ],
+                )
+                : _ActivityTab(
+                  provider: activityProvider,
+                  emptyMessage: 'まだCweet・返信・recweetがありません',
+                  onRefresh: () async {
+                    ref.invalidate(
+                      cwitterUserActivityProvider(profileUser.authorId),
+                    );
+                    ref.invalidate(
+                      filteredCwitterUserActivityProvider(profileUser.authorId),
+                    );
+                    await ref.read(
+                      cwitterUserActivityProvider(profileUser.authorId).future,
+                    );
+                  },
+                ),
       ),
     );
   }
@@ -314,10 +330,7 @@ class _SliverTabBarDelegate extends SliverPersistentHeaderDelegate {
     double shrinkOffset,
     bool overlapsContent,
   ) {
-    return Material(
-      color: backgroundColor,
-      child: tabBar,
-    );
+    return Material(color: backgroundColor, child: tabBar);
   }
 
   @override
@@ -342,9 +355,12 @@ class _ProfileHeader extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
-    final countsAsync = ref.watch(cwitterFollowCountsProvider(profileUser.authorId));
-    final cweetCountsAsync =
-        ref.watch(cwitterUserCweetCountsProvider(profileUser.authorId));
+    final countsAsync = ref.watch(
+      cwitterFollowCountsProvider(profileUser.authorId),
+    );
+    final cweetCountsAsync = ref.watch(
+      cwitterUserCweetCountsProvider(profileUser.authorId),
+    );
     final countsOverride =
         ref.watch(cwitterFollowCountsOverrideProvider)[profileUser.authorId];
 
@@ -360,18 +376,21 @@ class _ProfileHeader extends ConsumerWidget {
     );
 
     final hiddenUserIds = ref.watch(hiddenUserIdsProvider).valueOrNull ?? {};
-    final tags = ref.watch(cwitterUserTagsProvider(profileUser.authorId)).valueOrNull ??
+    final tags =
+        ref.watch(cwitterUserTagsProvider(profileUser.authorId)).valueOrNull ??
         profileUser.tags;
     final resolvedName = resolveAuthorDisplayName(
       ref.watch(
-        authorDisplayNameProvider(
-          (authorId: profileUser.authorId, fallback: profileUser.displayName),
-        ),
+        authorDisplayNameProvider((
+          authorId: profileUser.authorId,
+          fallback: profileUser.displayName,
+        )),
       ),
       profileUser.displayName,
     );
     final isHidden = hiddenUserIds.contains(profileUser.authorId);
-    final showFollowButton = !isSelf &&
+    final showFollowButton =
+        !isSelf &&
         currentUid != null &&
         ref.watch(hasCwitterIdProvider) &&
         !isHidden;
@@ -418,6 +437,11 @@ class _ProfileHeader extends ConsumerWidget {
                           displayName: resolvedName,
                           cwitterId: profileUser.cwitterId,
                           tags: tags,
+                          onTagTap: (tag) => Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) => CwitterHashtagUsersScreen(tag: tag),
+                            ),
+                          ),
                           nameStyle: theme.textTheme.titleMedium?.copyWith(
                             fontWeight: FontWeight.bold,
                           ),
@@ -427,7 +451,7 @@ class _ProfileHeader extends ConsumerWidget {
                           cwitterId: profileUser.cwitterId,
                           showOfficialTag: false,
                           style: theme.textTheme.bodyMedium?.copyWith(
-                            color: const Color(0xFF2E7D32),
+                            color: AppColors.accent(context, const Color(0xFF2E7D32)),
                             fontWeight: FontWeight.w500,
                           ),
                         ),
@@ -462,7 +486,7 @@ class _ProfileHeader extends ConsumerWidget {
                     return Text(
                       '読み込み中…',
                       style: theme.textTheme.bodySmall?.copyWith(
-                        color: colorScheme.onSurface.withValues(alpha: 0.5),
+                        color: colorScheme.onSurfaceVariant,
                       ),
                     );
                   }
@@ -471,14 +495,14 @@ class _ProfileHeader extends ConsumerWidget {
                     return Text(
                       'プロフィール情報を取得できません',
                       style: theme.textTheme.bodySmall?.copyWith(
-                        color: colorScheme.onSurface.withValues(alpha: 0.5),
+                        color: colorScheme.onSurfaceVariant,
                       ),
                     );
                   }
 
                   final displayCounts = resolveCwitterFollowCounts(
-                    server: countsAsync.valueOrNull ??
-                        const CwitterFollowCounts(),
+                    server:
+                        countsAsync.valueOrNull ?? const CwitterFollowCounts(),
                     override: countsOverride,
                   );
                   final cweetCount =
@@ -486,10 +510,7 @@ class _ProfileHeader extends ConsumerWidget {
 
                   return Row(
                     children: [
-                      _FollowCountLabel(
-                        count: cweetCount,
-                        label: 'Cweet',
-                      ),
+                      _FollowCountLabel(count: cweetCount, label: 'Cweet'),
                       const SizedBox(width: 20),
                       _FollowCountLabel(
                         count: displayCounts.followingCount,
@@ -497,11 +518,12 @@ class _ProfileHeader extends ConsumerWidget {
                         onTap: () {
                           Navigator.of(context).push(
                             MaterialPageRoute<void>(
-                              builder: (_) => CwitterFollowListScreen(
-                                userId: profileUser.authorId,
-                                userDisplayName: profileUser.displayName,
-                                kind: CwitterFollowListKind.following,
-                              ),
+                              builder:
+                                  (_) => CwitterFollowListScreen(
+                                    userId: profileUser.authorId,
+                                    userDisplayName: profileUser.displayName,
+                                    kind: CwitterFollowListKind.following,
+                                  ),
                             ),
                           );
                         },
@@ -513,11 +535,12 @@ class _ProfileHeader extends ConsumerWidget {
                         onTap: () {
                           Navigator.of(context).push(
                             MaterialPageRoute<void>(
-                              builder: (_) => CwitterFollowListScreen(
-                                userId: profileUser.authorId,
-                                userDisplayName: profileUser.displayName,
-                                kind: CwitterFollowListKind.followers,
-                              ),
+                              builder:
+                                  (_) => CwitterFollowListScreen(
+                                    userId: profileUser.authorId,
+                                    userDisplayName: profileUser.displayName,
+                                    kind: CwitterFollowListKind.followers,
+                                  ),
                             ),
                           );
                         },
@@ -572,23 +595,15 @@ class _ProfileTagsSectionState extends ConsumerState<_ProfileTagsSection> {
 
     setState(() => _isSaving = true);
     try {
-      await saveCwitterTags(
-        ref,
-        uid: widget.authorId,
-        tags: result,
-      );
+      await saveCwitterTags(ref, uid: widget.authorId, tags: result);
       if (!mounted) return;
       final cleared = CwitterService.normalizeCwitterTags(result).isEmpty;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(cleared ? 'ハッシュタグを削除しました' : 'ハッシュタグを保存しました'),
-        ),
+        SnackBar(content: Text(cleared ? 'ハッシュタグを削除しました' : 'ハッシュタグを保存しました')),
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$e')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
     } finally {
       if (mounted) {
         setState(() => _isSaving = false);
@@ -612,13 +627,14 @@ class _ProfileTagsSectionState extends ConsumerState<_ProfileTagsSection> {
       alignment: Alignment.centerLeft,
       child: TextButton.icon(
         onPressed: _isSaving ? null : () => _showTagsEditor(tags),
-        icon: _isSaving
-            ? const SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : Icon(Icons.sell_outlined, size: 16, color: mutedColor),
+        icon:
+            _isSaving
+                ? const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+                : Icon(Icons.sell_outlined, size: 16, color: mutedColor),
         label: Text(
           tags.isEmpty ? 'ハッシュタグを追加' : 'ハッシュタグを編集',
           style: theme.textTheme.bodySmall?.copyWith(color: mutedColor),
@@ -670,9 +686,8 @@ class _CwitterTagsEditorDialogState extends State<_CwitterTagsEditorDialog> {
     if (trimmed.isEmpty) {
       return optional ? null : _validateTag1Required(value);
     }
-    final normalized = trimmed.startsWith('#')
-        ? trimmed.substring(1).trim()
-        : trimmed;
+    final normalized =
+        trimmed.startsWith('#') ? trimmed.substring(1).trim() : trimmed;
     if (!AppConstants.isValidCwitterTag(normalized)) {
       return AppConstants.errorCwitterTagFormat;
     }
@@ -690,10 +705,7 @@ class _CwitterTagsEditorDialogState extends State<_CwitterTagsEditorDialog> {
 
   void _save() {
     if (_formKey.currentState?.validate() != true) return;
-    Navigator.of(context).pop([
-      _tag1Controller.text,
-      _tag2Controller.text,
-    ]);
+    Navigator.of(context).pop([_tag1Controller.text, _tag2Controller.text]);
   }
 
   @override
@@ -710,7 +722,8 @@ class _CwitterTagsEditorDialogState extends State<_CwitterTagsEditorDialog> {
               decoration: const InputDecoration(
                 labelText: 'ハッシュタグ 1',
                 hintText: '例: 27卒',
-                helperText: '${AppConstants.cwitterTagsInputHelper}\n空のまま保存するとタグを削除できます',
+                helperText:
+                    '${AppConstants.cwitterTagsInputHelper}\n空のまま保存するとタグを削除できます',
                 border: OutlineInputBorder(),
                 prefixText: '#',
               ),
@@ -737,7 +750,7 @@ class _CwitterTagsEditorDialogState extends State<_CwitterTagsEditorDialog> {
         ),
         FilledButton(
           onPressed: _save,
-          style: FilledButton.styleFrom(
+          style: FilledButton.styleFrom(foregroundColor: AppColors.onColor(const Color(0xFF4CAF50)),
             backgroundColor: const Color(0xFF4CAF50),
           ),
           child: const Text('保存'),
@@ -831,7 +844,7 @@ class _ProfileBioSectionState extends ConsumerState<_ProfileBioSection> {
                 if (formKey.currentState?.validate() != true) return;
                 Navigator.of(dialogContext).pop(true);
               },
-              style: FilledButton.styleFrom(
+              style: FilledButton.styleFrom(foregroundColor: AppColors.onColor(const Color(0xFF4CAF50)),
                 backgroundColor: const Color(0xFF4CAF50),
               ),
               child: const Text('保存'),
@@ -850,14 +863,12 @@ class _ProfileBioSectionState extends ConsumerState<_ProfileBioSection> {
         bio: controller.text,
       );
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('自己紹介を保存しました')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('自己紹介を保存しました')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$e')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
     } finally {
       controller.dispose();
       if (mounted) {
@@ -881,13 +892,14 @@ class _ProfileBioSectionState extends ConsumerState<_ProfileBioSection> {
     if (widget.isSelf && (bio == null || bio.isEmpty)) {
       return OutlinedButton.icon(
         onPressed: _isSaving ? null : () => _showBioEditor(bio),
-        icon: _isSaving
-            ? const SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.edit_outlined, size: 18),
+        icon:
+            _isSaving
+                ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+                : const Icon(Icons.edit_outlined, size: 18),
         label: const Text('自己紹介を追加'),
         style: OutlinedButton.styleFrom(
           foregroundColor: const Color(0xFF2E7D32),
@@ -906,7 +918,8 @@ class _ProfileBioSectionState extends ConsumerState<_ProfileBioSection> {
           color: colorScheme.onSurface.withValues(alpha: 0.85),
           height: 1.45,
         );
-        final canExpand = bioStyle != null &&
+        final canExpand =
+            bioStyle != null &&
             _textExceedsLineLimit(
               bio!,
               bioStyle,
@@ -936,7 +949,7 @@ class _ProfileBioSectionState extends ConsumerState<_ProfileBioSection> {
                   child: Text(
                     _bioExpanded ? '折りたたむ' : '続きを読む',
                     style: theme.textTheme.bodySmall?.copyWith(
-                      color: const Color(0xFF2E7D32),
+                      color: AppColors.accent(context, const Color(0xFF2E7D32)),
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -949,16 +962,23 @@ class _ProfileBioSectionState extends ConsumerState<_ProfileBioSection> {
                 alignment: Alignment.centerLeft,
                 child: TextButton.icon(
                   onPressed: _isSaving ? null : () => _showBioEditor(bio),
-                  icon: _isSaving
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : Icon(Icons.edit_outlined, size: 16, color: mutedColor),
+                  icon:
+                      _isSaving
+                          ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                          : Icon(
+                            Icons.edit_outlined,
+                            size: 16,
+                            color: mutedColor,
+                          ),
                   label: Text(
                     '自己紹介を編集',
-                    style: theme.textTheme.bodySmall?.copyWith(color: mutedColor),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: mutedColor,
+                    ),
                   ),
                   style: TextButton.styleFrom(
                     padding: EdgeInsets.zero,
@@ -989,8 +1009,7 @@ class _FollowCountLabel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final mutedColor =
-        theme.colorScheme.onSurface.withValues(alpha: 0.65);
+    final mutedColor = theme.colorScheme.onSurface.withValues(alpha: 0.65);
 
     final content = RichText(
       text: TextSpan(
@@ -998,9 +1017,9 @@ class _FollowCountLabel extends StatelessWidget {
         children: [
           TextSpan(
             text: '$count',
-            style: const TextStyle(
+            style: TextStyle(
               fontWeight: FontWeight.bold,
-              color: Color(0xFF2E7D32),
+              color: AppColors.accent(context, Color(0xFF2E7D32)),
             ),
           ),
           TextSpan(text: ' $label'),
@@ -1022,10 +1041,7 @@ class _FollowCountLabel extends StatelessWidget {
 }
 
 class _FollowButton extends ConsumerStatefulWidget {
-  const _FollowButton({
-    required this.followerId,
-    required this.followeeId,
-  });
+  const _FollowButton({required this.followerId, required this.followeeId});
 
   final String followerId;
   final String followeeId;
@@ -1039,20 +1055,25 @@ class _FollowButtonState extends ConsumerState<_FollowButton> {
   bool? _optimisticFollowing;
 
   ({String followerId, String followeeId}) get _followTarget => (
-        followerId: widget.followerId,
-        followeeId: widget.followeeId,
-      );
+    followerId: widget.followerId,
+    followeeId: widget.followeeId,
+  );
 
   Future<void> _toggleFollow(bool currentlyFollowing) async {
     if (_isUpdating) return;
 
     final targetFollowing = !currentlyFollowing;
-    final countsNotifier =
-        ref.read(cwitterFollowCountsOverrideProvider.notifier);
+    final countsNotifier = ref.read(
+      cwitterFollowCountsOverrideProvider.notifier,
+    );
     final delta = targetFollowing ? 1 : -1;
 
-    final followeeAsync = ref.read(cwitterFollowCountsProvider(widget.followeeId));
-    final followerAsync = ref.read(cwitterFollowCountsProvider(widget.followerId));
+    final followeeAsync = ref.read(
+      cwitterFollowCountsProvider(widget.followeeId),
+    );
+    final followerAsync = ref.read(
+      cwitterFollowCountsProvider(widget.followerId),
+    );
 
     if (followeeAsync.hasValue && followerAsync.hasValue) {
       final followeeCounts = followeeAsync.requireValue;
@@ -1073,15 +1094,17 @@ class _FollowButtonState extends ConsumerState<_FollowButton> {
 
       countsNotifier.apply(
         userId: widget.followeeId,
-        followerCount: followeeBase.followerCount + delta < 0
-            ? 0
-            : followeeBase.followerCount + delta,
+        followerCount:
+            followeeBase.followerCount + delta < 0
+                ? 0
+                : followeeBase.followerCount + delta,
       );
       countsNotifier.apply(
         userId: widget.followerId,
-        followingCount: followerBase.followingCount + delta < 0
-            ? 0
-            : followerBase.followingCount + delta,
+        followingCount:
+            followerBase.followingCount + delta < 0
+                ? 0
+                : followerBase.followingCount + delta,
       );
     }
 
@@ -1109,10 +1132,7 @@ class _FollowButtonState extends ConsumerState<_FollowButton> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            cwitterFollowActionErrorMessage(
-              e,
-              unfollow: currentlyFollowing,
-            ),
+            cwitterFollowActionErrorMessage(e, unfollow: currentlyFollowing),
           ),
         ),
       );
@@ -1129,32 +1149,34 @@ class _FollowButtonState extends ConsumerState<_FollowButton> {
       cwitterIsFollowingProvider(_followTarget),
     );
 
-    ref.listen<AsyncValue<bool>>(
-      cwitterIsFollowingProvider(_followTarget),
-      (previous, next) {
-        next.whenData((streamValue) {
-          if (!mounted || _optimisticFollowing == null || _isUpdating) return;
-          if (streamValue == _optimisticFollowing) {
-            setState(() => _optimisticFollowing = null);
-          }
-        });
-      },
-    );
+    ref.listen<AsyncValue<bool>>(cwitterIsFollowingProvider(_followTarget), (
+      previous,
+      next,
+    ) {
+      next.whenData((streamValue) {
+        if (!mounted || _optimisticFollowing == null || _isUpdating) return;
+        if (streamValue == _optimisticFollowing) {
+          setState(() => _optimisticFollowing = null);
+        }
+      });
+    });
 
     return isFollowingAsync.when(
-      loading: () => const Align(
-        alignment: Alignment.centerLeft,
-        child: SizedBox(
-          width: 24,
-          height: 24,
-          child: CircularProgressIndicator(strokeWidth: 2),
-        ),
-      ),
+      loading:
+          () => const Align(
+            alignment: Alignment.centerLeft,
+            child: SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
       error: (_, __) => const SizedBox.shrink(),
       data: (streamFollowing) {
         final isFollowing = _optimisticFollowing ?? streamFollowing;
-        final mutedColor =
-            Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.75);
+        final mutedColor = Theme.of(
+          context,
+        ).colorScheme.onSurface.withValues(alpha: 0.75);
 
         if (isFollowing) {
           return OutlinedButton(
@@ -1162,10 +1184,9 @@ class _FollowButtonState extends ConsumerState<_FollowButton> {
             style: OutlinedButton.styleFrom(
               foregroundColor: mutedColor,
               side: BorderSide(
-                color: Theme.of(context)
-                    .colorScheme
-                    .outlineVariant
-                    .withValues(alpha: 0.8),
+                color: Theme.of(
+                  context,
+                ).colorScheme.outlineVariant.withValues(alpha: 0.8),
               ),
               padding: const EdgeInsets.symmetric(vertical: 10),
             ),
@@ -1177,7 +1198,7 @@ class _FollowButtonState extends ConsumerState<_FollowButton> {
           onPressed: _isUpdating ? null : () => _toggleFollow(false),
           style: FilledButton.styleFrom(
             backgroundColor: const Color(0xFF4CAF50),
-            foregroundColor: Colors.white,
+            foregroundColor: AppColors.onColor(const Color(0xFF4CAF50)),
             padding: const EdgeInsets.symmetric(vertical: 10),
           ),
           child: const Text('フォローする'),
@@ -1206,22 +1227,23 @@ class _ActivityTab extends ConsumerWidget {
 
     return activityAsync.when(
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (error, _) => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text('読み込みに失敗しました: $error'),
-              const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: onRefresh,
-                child: const Text('再読み込み'),
+      error:
+          (error, _) => Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text('読み込みに失敗しました: $error'),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                    onPressed: onRefresh,
+                    child: const Text('再読み込み'),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
       data: (activities) {
         if (activities.isEmpty) {
           return RefreshIndicator(
@@ -1236,7 +1258,7 @@ class _ActivityTab extends ConsumerWidget {
                       emptyMessage,
                       textAlign: TextAlign.center,
                       style: theme.textTheme.bodyMedium?.copyWith(
-                        color: colorScheme.onSurface.withValues(alpha: 0.6),
+                        color: colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ),
@@ -1252,8 +1274,9 @@ class _ActivityTab extends ConsumerWidget {
             physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
             itemCount: activities.length,
-            itemBuilder: (context, index) =>
-                CwitterActivityCard(activity: activities[index]),
+            itemBuilder:
+                (context, index) =>
+                    CwitterActivityCard(activity: activities[index]),
           ),
         );
       },
@@ -1280,22 +1303,23 @@ class _PostsTab extends ConsumerWidget {
 
     return postsAsync.when(
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (error, _) => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text('読み込みに失敗しました: $error'),
-              const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: onRefresh,
-                child: const Text('再読み込み'),
+      error:
+          (error, _) => Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text('読み込みに失敗しました: $error'),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                    onPressed: onRefresh,
+                    child: const Text('再読み込み'),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
       data: (posts) {
         if (posts.isEmpty) {
           return RefreshIndicator(
@@ -1310,7 +1334,7 @@ class _PostsTab extends ConsumerWidget {
                       emptyMessage,
                       textAlign: TextAlign.center,
                       style: theme.textTheme.bodyMedium?.copyWith(
-                        color: colorScheme.onSurface.withValues(alpha: 0.6),
+                        color: colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ),
@@ -1326,8 +1350,8 @@ class _PostsTab extends ConsumerWidget {
             physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
             itemCount: posts.length,
-            itemBuilder: (context, index) =>
-                CwitterPostCard(post: posts[index]),
+            itemBuilder:
+                (context, index) => CwitterPostCard(post: posts[index]),
           ),
         );
       },

@@ -16,7 +16,11 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
+<<<<<<< HEAD
 version: 2.2.0+70
+=======
+version: 2.3.3+84
+>>>>>>> upstream/main
 
 environment:
   sdk: '>=3.7.0-0 <4.0.0'
@@ -43,6 +47,8 @@ dependencies:
   firebase_storage: ^12.3.1
   firebase_app_check: ^0.3.1+3
   firebase_messaging: ^15.1.6
+  firebase_remote_config: ^5.5.0
+  package_info_plus: ^8.3.1
   
   # State management
   flutter_riverpod: ^2.6.1
@@ -77,6 +83,8 @@ dependencies:
   # Image caching and picker
   cached_network_image: ^3.3.1
   image_picker: ^1.0.8
+  image: ^4.3.0
+  mime: ^2.0.0
   
   # JSON serialization
   freezed_annotation: ^2.4.4
@@ -133,6 +141,17 @@ dev_dependencies:
   
   # App icon generation
   flutter_launcher_icons: ^0.14.1
+  fake_cloud_firestore: ^3.1.0
+  firebase_auth_mocks: ^0.14.2
+  firebase_core_platform_interface: ^6.0.3
+
+# path_provider_android 2.3.0: release で PathUtils ClassNotFoundException
+dependency_overrides:
+  path_provider_android: 2.3.1
+  # Android transaction timeout fix, backported from FlutterFire #18668.
+  # Keep the existing Firebase/iOS compatibility; see third_party/cloud_firestore/PATCHES.md.
+  cloud_firestore:
+    path: third_party/cloud_firestore
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -149,6 +168,7 @@ flutter:
   assets:
     - assets/icons/
     - assets/images/
+    - assets/images/campus_maps/
     - assets/data/
     - assets/train/
     - assets/sounds/chiba_channel_reply_pop.wav

@@ -3,11 +3,7 @@ import 'package:flutter/material.dart';
 import '../../../core/constants/app_constants.dart';
 
 class CwitterTagsRow extends StatelessWidget {
-  const CwitterTagsRow({
-    super.key,
-    required this.tags,
-    this.compact = false,
-  });
+  const CwitterTagsRow({super.key, required this.tags, this.compact = false});
 
   final List<String> tags;
   final bool compact;
@@ -19,10 +15,11 @@ class CwitterTagsRow extends StatelessWidget {
     return Wrap(
       spacing: 4,
       runSpacing: 4,
-      children: tags
-          .take(AppConstants.cwitterTagsMaxCount)
-          .map((tag) => CwitterTagChip(tag: tag, compact: compact))
-          .toList(),
+      children:
+          tags
+              .take(AppConstants.cwitterTagsMaxCount)
+              .map((tag) => CwitterTagChip(tag: tag, compact: compact))
+              .toList(),
     );
   }
 }
@@ -33,10 +30,12 @@ class CwitterTagChip extends StatelessWidget {
     super.key,
     required this.tag,
     this.compact = false,
+    this.onTap,
   });
 
   final String tag;
   final bool compact;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -47,12 +46,34 @@ class CwitterTagChip extends StatelessWidget {
     final verticalPadding = compact ? 2.0 : 3.0;
     final textColor =
         isDark ? const Color(0xFF9AE6A0) : const Color(0xFF2E7D32);
-    final backgroundColor = isDark
-        ? textColor.withValues(alpha: 0.22)
-        : const Color(0xFF4CAF50).withValues(alpha: 0.12);
-    final borderColor = isDark
-        ? textColor.withValues(alpha: 0.55)
-        : const Color(0xFF4CAF50).withValues(alpha: 0.28);
+    final backgroundColor =
+        isDark
+            ? textColor.withValues(alpha: 0.22)
+            : const Color(0xFF4CAF50).withValues(alpha: 0.12);
+    final borderColor =
+        isDark
+            ? textColor.withValues(alpha: 0.55)
+            : const Color(0xFF4CAF50).withValues(alpha: 0.28);
+
+    final label = Text(
+      '#$tag',
+      style: theme.textTheme.labelSmall?.copyWith(
+        fontSize: fontSize,
+        color: textColor,
+        fontWeight: FontWeight.w600,
+      ),
+    );
+    if (onTap != null) {
+      return ActionChip(
+        label: label,
+        onPressed: onTap,
+        tooltip: '#$tag を使っている人を見る',
+        backgroundColor: backgroundColor,
+        side: BorderSide(color: borderColor),
+        shape: const StadiumBorder(),
+        materialTapTargetSize: MaterialTapTargetSize.padded,
+      );
+    }
 
     return Container(
       padding: EdgeInsets.symmetric(
@@ -64,14 +85,7 @@ class CwitterTagChip extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
         border: Border.all(color: borderColor),
       ),
-      child: Text(
-        '#$tag',
-        style: theme.textTheme.labelSmall?.copyWith(
-          fontSize: fontSize,
-          color: textColor,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
+      child: label,
     );
   }
 }

@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import '../core/providers/firebase_campus_provider.dart';
 import 'common/animated_image_placeholder.dart';
+import 'common/safe_cached_network_image.dart';
+import 'campus_map_image.dart';
 
 class CampusMapWidget extends ConsumerWidget {
   final String campus;
@@ -29,24 +29,10 @@ class CampusMapWidget extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        campusMapAsync.when(
-          data: (mapUrl) {
-            debugPrint('🗺️ Campus map data received | campus=$campus, url=$mapUrl');
-            if (mapUrl == null || mapUrl.isEmpty) {
-              debugPrint('❌ Campus map URL is null or empty | campus=$campus');
-              return _buildErrorWidget(context, 'キャンパスマップが見つかりません');
-            }
-            return _buildMapWidget(context, mapUrl, campusOptions);
-          },
-          loading: () {
-            debugPrint('⏳ Loading campus map | campus=$campus');
-            return _buildLoadingWidget(context);
-          },
-          error: (error, stackTrace) {
-            debugPrint('❌ Campus map error | campus=$campus, error=$error');
-            debugPrint('❌ StackTrace: $stackTrace');
-            return _buildErrorWidget(context, 'キャンパスマップの読み込みに失敗しました');
-          },
+        _buildMapWidget(
+          context,
+          campusMapAsync.valueOrNull ?? '',
+          campusOptions,
         ),
         if (showTitle)
           Padding(
@@ -73,72 +59,20 @@ class CampusMapWidget extends ConsumerWidget {
       height: height ?? 200,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.grey.shade300),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(8),
         child: GestureDetector(
           onTap:
               () => _showFullScreenMap(context, campus, mapUrl, campusOptions),
-          child:
-              kIsWeb
-                  ? Image.network(
-                    mapUrl,
-                    width: width,
-                    height: height ?? 200,
-                    fit: BoxFit.cover,
-                    loadingBuilder: (context, child, loadingProgress) {
-                      if (loadingProgress == null) return child;
-                      return _buildLoadingWidget(context);
-                    },
-                    errorBuilder: (context, error, stackTrace) {
-                      return _buildErrorWidget(context, 'マップ画像の読み込みエラー');
-                    },
-                  )
-                  : CachedNetworkImage(
-                    imageUrl: mapUrl,
-                    width: width,
-                    height: height ?? 200,
-                    fit: BoxFit.cover,
-                    placeholder: (context, url) => _buildLoadingWidget(context),
-                    errorWidget:
-                        (context, url, error) =>
-                            _buildErrorWidget(context, 'マップ画像の読み込みエラー'),
-                  ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLoadingWidget(BuildContext context) {
-    return AnimatedImagePlaceholder(
-      width: width ?? double.infinity,
-      height: height ?? 200,
-      borderRadius: 8,
-    );
-  }
-
-  Widget _buildErrorWidget(BuildContext context, String message) {
-    return Container(
-      width: width ?? double.infinity,
-      height: height ?? 200,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
-        color: Colors.grey.shade100,
-        border: Border.all(color: Colors.grey.shade300),
-      ),
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.map, color: Colors.grey.shade600, size: 32),
-            const SizedBox(height: 8),
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
-            ),
-          ],
+          child: CampusMapImage(
+            campus: campus,
+            imageUrl: mapUrl,
+            width: width,
+            height: height ?? 200,
+            fit: BoxFit.cover,
+          ),
         ),
       ),
     );
@@ -289,9 +223,10 @@ class _FullScreenCampusMapDialogState
       final translateX = viewportCenter.dx - (tapPosition.dx * _zoomedScale);
       final translateY = viewportCenter.dy - (tapPosition.dy * _zoomedScale);
 
-      controller.value = Matrix4.identity()
-        ..translate(translateX, translateY)
-        ..scale(_zoomedScale);
+      controller.value =
+          Matrix4.identity()
+            ..translate(translateX, translateY)
+            ..scale(_zoomedScale);
     }
   }
 
@@ -342,54 +277,57 @@ class _FullScreenCampusMapDialogState
           child: Transform.scale(
             scale: dragScale,
             child: Stack(
-            children: [
-              Positioned.fill(
-                child: PageView.builder(
-                  controller: _pageController,
-                  // 画像が拡大されている場合はスワイプを無効化
-                  physics: (_isImageZoomed || _isInteractingWithImage)
-                      ? const NeverScrollableScrollPhysics()
-                      : const PageScrollPhysics(),
-                  itemCount: _entries.length,
-                  onPageChanged: (index) {
-                    if (index >= 0 && index < _entries.length) {
-                      final newCampusKey = _entries[index].key;
-                      // 切り替え先のマップのズームをリセット
-                      final newController = _transformationControllers[newCampusKey];
-                      if (newController != null) {
-                        newController.value = Matrix4.identity();
+              children: [
+                Positioned.fill(
+                  child: PageView.builder(
+                    controller: _pageController,
+                    // 画像が拡大されている場合はスワイプを無効化
+                    physics:
+                        (_isImageZoomed || _isInteractingWithImage)
+                            ? const NeverScrollableScrollPhysics()
+                            : const PageScrollPhysics(),
+                    itemCount: _entries.length,
+                    onPageChanged: (index) {
+                      if (index >= 0 && index < _entries.length) {
+                        final newCampusKey = _entries[index].key;
+                        // 切り替え先のマップのズームをリセット
+                        final newController =
+                            _transformationControllers[newCampusKey];
+                        if (newController != null) {
+                          newController.value = Matrix4.identity();
+                        }
+                        setState(() {
+                          _currentIndex = index;
+                          _isImageZoomed = false;
+                        });
                       }
-                      setState(() {
-                        _currentIndex = index;
-                        _isImageZoomed = false;
-                      });
-                    }
-                  },
-                  itemBuilder: (context, index) {
-                    final entry = _entries[index];
-                    return _buildCampusPage(context, entry.key, entry.value);
-                  },
-                ),
-              ),
-              if (_showChrome) _buildTopControls(context),
-              if (_showChrome && _entries.length > 1) _buildCampusSelector(context),
-              if (_showChrome)
-                Positioned(
-                top: MediaQuery.of(context).padding.top + 16,
-                left: 24,
-                child: Text(
-                  _entries[_currentIndex].value,
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
+                    },
+                    itemBuilder: (context, index) {
+                      final entry = _entries[index];
+                      return _buildCampusPage(context, entry.key, entry.value);
+                    },
                   ),
                 ),
-              ),
-              if (_showChrome) _buildDoubleTapHint(context),
-            ],
+                if (_showChrome) _buildTopControls(context),
+                if (_showChrome && _entries.length > 1)
+                  _buildCampusSelector(context),
+                if (_showChrome)
+                  Positioned(
+                    top: MediaQuery.of(context).padding.top + 16,
+                    left: 24,
+                    child: Text(
+                      _entries[_currentIndex].value,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                if (_showChrome) _buildDoubleTapHint(context),
+              ],
+            ),
           ),
-        ),
         ),
       ),
     );
@@ -402,102 +340,44 @@ class _FullScreenCampusMapDialogState
   ) {
     final mapAsync = ref.watch(campusMapProvider(campusKey));
 
-    return mapAsync.when(
-      data: (mapUrl) {
-        final effectiveUrl =
-            mapUrl ??
-            (campusKey == widget.initialCampus ? widget.initialMapUrl : null);
-        if (effectiveUrl == null || effectiveUrl.isEmpty) {
-          return _buildMessage(context, '${campusName}のマップが見つかりません');
-        }
-        
-        final imageWidget = kIsWeb
-            ? Image.network(
-                effectiveUrl,
-                width: double.infinity,
-                height: double.infinity,
-                fit: BoxFit.contain,
-                loadingBuilder: (context, child, loadingProgress) {
-                  if (loadingProgress == null) return child;
-                  return const AnimatedImagePlaceholder(
-                    width: 220,
-                    height: 220,
-                    borderRadius: 12,
-                    borderColor: Colors.white24,
-                  );
-                },
-                errorBuilder:
-                    (context, error, stackTrace) => _buildMessage(
-                      context,
-                      '${campusName}のマップの読み込みに失敗しました',
-                    ),
-              )
-            : CachedNetworkImage(
-                imageUrl: effectiveUrl,
-                width: double.infinity,
-                height: double.infinity,
-                fit: BoxFit.contain,
-                placeholder:
-                    (context, url) => const AnimatedImagePlaceholder(
-                      width: 220,
-                      height: 220,
-                      borderRadius: 12,
-                      borderColor: Colors.white24,
-                    ),
-                errorWidget:
-                    (context, url, error) => _buildMessage(
-                      context,
-                      '${campusName}のマップの読み込みに失敗しました',
-                    ),
-              );
+    final imageWidget = CampusMapImage(
+      campus: campusKey,
+      imageUrl: mapAsync.valueOrNull ?? '',
+      width: double.infinity,
+      height: double.infinity,
+      fit: BoxFit.contain,
+    );
 
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            return Material(
-              color: Colors.transparent,
-              child: GestureDetector(
-                behavior: HitTestBehavior.translucent,
-                onTap: () => setState(() => _showChrome = !_showChrome),
-                onDoubleTapDown:
-                    (details) => _handleDoubleTap(
-                      campusKey,
-                      details,
-                      constraints.biggest,
-                    ),
-                child: InteractiveViewer(
-                  transformationController:
-                      _transformationControllers[campusKey],
-                  minScale: 0.5,
-                  maxScale: 4.0,
-                  panEnabled: true,
-                  onInteractionStart: (_) {
-                    if (!_isInteractingWithImage) {
-                      setState(() => _isInteractingWithImage = true);
-                    }
-                  },
-                  onInteractionEnd: (_) {
-                    if (_isInteractingWithImage) {
-                      setState(() => _isInteractingWithImage = false);
-                    }
-                  },
-                  child: SizedBox.expand(child: imageWidget),
-                ),
-              ),
-            );
-          },
-        );
-      },
-      loading:
-          () => const Center(
-            child: AnimatedImagePlaceholder(
-              width: 240,
-              height: 240,
-              borderRadius: 16,
-              borderColor: Colors.white24,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return Material(
+          color: Colors.transparent,
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: () => setState(() => _showChrome = !_showChrome),
+            onDoubleTapDown:
+                (details) =>
+                    _handleDoubleTap(campusKey, details, constraints.biggest),
+            child: InteractiveViewer(
+              transformationController: _transformationControllers[campusKey],
+              minScale: 0.5,
+              maxScale: 4.0,
+              panEnabled: true,
+              onInteractionStart: (_) {
+                if (!_isInteractingWithImage) {
+                  setState(() => _isInteractingWithImage = true);
+                }
+              },
+              onInteractionEnd: (_) {
+                if (_isInteractingWithImage) {
+                  setState(() => _isInteractingWithImage = false);
+                }
+              },
+              child: SizedBox.expand(child: imageWidget),
             ),
           ),
-      error:
-          (error, _) => _buildMessage(context, '${campusName}のマップの読み込みに失敗しました'),
+        );
+      },
     );
   }
 
@@ -506,7 +386,7 @@ class _FullScreenCampusMapDialogState
     if (_isImageZoomed) {
       return const SizedBox.shrink();
     }
-    
+
     final bottomPadding = MediaQuery.of(context).padding.bottom;
     // キャンパスセレクタの上に表示
     // キャンパスセレクタは bottomPadding + 72 に配置されているので、
@@ -524,10 +404,7 @@ class _FullScreenCampusMapDialogState
           ),
           child: const Text(
             'ダブルタップで拡大・縮小、ドラッグで移動できます',
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 12,
-            ),
+            style: TextStyle(color: Colors.white70, fontSize: 12),
           ),
         ),
       ),
@@ -610,22 +487,6 @@ class _FullScreenCampusMapDialogState
     );
   }
 
-  Widget _buildMessage(BuildContext context, String message) {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.info_outline, color: Colors.white70, size: 48),
-          const SizedBox(height: 16),
-          Text(
-            message,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white70),
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 class FloorMapWidget extends ConsumerWidget {
@@ -682,40 +543,22 @@ class FloorMapWidget extends ConsumerWidget {
       height: height ?? 200,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.grey.shade300),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(8),
         child: GestureDetector(
           onTap:
               onTapForFullscreen ??
-              () =>
-                  _showFullScreenMap(context, campus, mapUrl, campusOptions),
-          child:
-              kIsWeb
-                  ? Image.network(
-                    mapUrl,
-                    width: width,
-                    height: height ?? 200,
-                    fit: BoxFit.cover,
-                    loadingBuilder: (context, child, loadingProgress) {
-                      if (loadingProgress == null) return child;
-                      return _buildLoadingWidget(context);
-                    },
-                    errorBuilder: (context, error, stackTrace) {
-                      return _buildErrorWidget(context, 'マップ画像の読み込みエラー');
-                    },
-                  )
-                  : CachedNetworkImage(
-                    imageUrl: mapUrl,
-                    width: width,
-                    height: height ?? 200,
-                    fit: BoxFit.cover,
-                    placeholder: (context, url) => _buildLoadingWidget(context),
-                    errorWidget:
-                        (context, url, error) =>
-                            _buildErrorWidget(context, 'マップ画像の読み込みエラー'),
-                  ),
+              () => _showFullScreenMap(context, campus, mapUrl, campusOptions),
+          child: SafeCachedNetworkImage(
+            imageUrl: mapUrl,
+            width: width,
+            height: height ?? 200,
+            fit: BoxFit.cover,
+            placeholder: _buildLoadingWidget(context),
+            errorWidget: _buildErrorWidget(context, 'マップ画像の読み込みエラー'),
+          ),
         ),
       ),
     );
@@ -735,19 +578,26 @@ class FloorMapWidget extends ConsumerWidget {
       height: height ?? 200,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(8),
-        color: Colors.grey.shade100,
-        border: Border.all(color: Colors.grey.shade300),
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
       ),
       child: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.location_on, color: Colors.grey.shade600, size: 32),
+            Icon(
+              Icons.location_on,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              size: 32,
+            ),
             const SizedBox(height: 8),
             Text(
               message,
               textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
           ],
         ),

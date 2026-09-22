@@ -3,6 +3,7 @@ const {setGlobalOptions} = require('firebase-functions/v2');
 const {
   onDocumentCreated,
   onDocumentUpdated,
+  onDocumentWritten,
 } = require('firebase-functions/v2/firestore');
 const {onSchedule} = require('firebase-functions/v2/scheduler');
 const {onRequest} = require('firebase-functions/v2/https');
@@ -12,6 +13,9 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 
 admin.initializeApp();
+const {createAdminAuthorizer, retiredBulkVerification} = require('./admin_http');
+const {getUserTokenEntries, removeInvalidToken} = require('./device_tokens');
+const authorizeAdmin = createAdminAuthorizer({auth: admin.auth(), firestore: admin.firestore()});
 
 // 優先順位: env(FUNCTIONS_REGION / FUNCTION_REGION) → us-central1
 const REGION = (
@@ -22,6 +26,52 @@ const REGION = (
 
 setGlobalOptions({region: REGION});
 
+const {beforeUserCreated} = require('firebase-functions/v2/identity');
+const {requireVerifiedRegistration} = require('./verified_registration');
+exports.requireVerifiedEmailBeforeCreate = beforeUserCreated(requireVerifiedRegistration);
+
+const {JOBS: DELETION_JOBS, createDeletionApi, createDeletionWorker} = require('./account_deletion');
+const deletionWorker = createDeletionWorker({auth: admin.auth(), db: admin.firestore(), bucket: admin.storage().bucket()});
+exports.deleteMyAccount = onRequest({timeoutSeconds: 60, cors: true},
+    createDeletionApi({auth: admin.auth(), db: admin.firestore()}));
+exports.processAccountDeletion = onDocumentCreated({document: `${DELETION_JOBS}/{uid}`, retry: true, timeoutSeconds: 540, memory: '512MiB'},
+    event => deletionWorker(event.params.uid));
+exports.retryAccountDeletions = onSchedule({schedule: 'every 15 minutes', timeoutSeconds: 540, memory: '512MiB'}, async () => {
+  const jobs = await admin.firestore().collection(DELETION_JOBS).where('status', 'in', ['queued', 'retry', 'running']).limit(10).get();
+  for (const job of jobs.docs) {
+    try { await deletionWorker(job.id); } catch (_) { console.error('Account deletion will retry'); }
+  }
+  // Keep the write-denial tombstone beyond the lifetime of any old ID token.
+  const expired = await admin.firestore().collection(DELETION_JOBS)
+      .where('completedAt', '<', admin.firestore.Timestamp.fromMillis(Date.now() - 7 * 86400000)).limit(100).get();
+  for (const job of expired.docs) await admin.firestore().recursiveDelete(job.ref);
+});
+
+const {syncFavoriteCounts} = require('./cafeteria_favorites');
+exports.syncCafeteriaFavoriteCounts = onDocumentWritten({
+  document: 'users/{userId}/cafeteria_favorites/{favoriteId}',
+  retry: true,
+}, event => syncFavoriteCounts(admin.firestore(), event.data?.before.data(), event.data?.after.data()));
+
+exports.syncCafeteriaMenuFavoriteCounts = onDocumentWritten({
+  document: 'cafeteria_menu_items/{menuItemId}',
+  retry: true,
+}, event => {
+  const before = event.data?.before.data();
+  const after = event.data?.after.data();
+  if (before && after && before.menuName === after.menuName && before.cafeteriaId === after.cafeteriaId) return;
+  const target = data => data ? {...data, type: 'menu', menuItemId: event.params.menuItemId} : undefined;
+  return syncFavoriteCounts(admin.firestore(), target(before), target(after));
+});
+
+function pickWebhookUrl(...candidates) {
+  for (const candidate of candidates) {
+    const value = String(candidate || '').trim();
+    if (value.startsWith('https://')) return value;
+  }
+  return null;
+}
+
 function getWebhook(kind) {
   // 優先順位: 種類別 env → 共通 env
   const envKey = {
@@ -29,19 +79,22 @@ function getWebhook(kind) {
     contacts: process.env.DISCORD_WEBHOOK_URL_CONTACTS,
     bulletin: process.env.DISCORD_WEBHOOK_URL_BULLETIN,
     menu: process.env.DISCORD_WEBHOOK_URL_MENU,
+    menu_image: process.env.DISCORD_WEBHOOK_URL_MENU_IMAGE,
     review: process.env.DISCORD_WEBHOOK_URL_REVIEW,
     report: process.env.DISCORD_WEBHOOK_URL_REPORT,
     coupon: process.env.DISCORD_WEBHOOK_URL_COUPON,
     comment: process.env.DISCORD_WEBHOOK_URL_COMMENT,
     cwitter: process.env.DISCORD_WEBHOOK_URL_CWITTER,
+    chiba_channel_thread: process.env.DISCORD_WEBHOOK_URL_CHIBA_CHANNEL_THREAD,
+    chiba_channel_reply: process.env.DISCORD_WEBHOOK_URL_CHIBA_CHANNEL_REPLY,
   };
   const generic = process.env.DISCORD_WEBHOOK_URL;
 
-  return (
-    envKey[kind] ||
-    generic ||
-    null
-  );
+  const url = pickWebhookUrl(envKey[kind], generic);
+  if (!url) {
+    console.warn(`No Discord webhook URL configured for kind="${kind}".`);
+  }
+  return url;
 }
 
 async function postToDiscord(webhookUrl, payload) {
@@ -96,6 +149,46 @@ function clampDiscordText(text, maxLen = 1024) {
   const value = String(text ?? '').trim() || '（なし）';
   if (value.length <= maxLen) return value;
   return `${value.substring(0, maxLen - 3)}...`;
+}
+
+function truncatePreview(text, maxLen = 40) {
+  const value = String(text ?? '').trim();
+  if (!value) return '';
+  if (value.length <= maxLen) return value;
+  return `${value.substring(0, maxLen)}…`;
+}
+
+function normalizeCwitterId(raw) {
+  return String(raw ?? '').trim().toLowerCase();
+}
+
+async function createInAppNotification(notification) {
+  try {
+    await admin.firestore().collection('notifications').add({
+      ...notification,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      isRead: false,
+    });
+    console.log(`アプリ内通知を作成: ${notification.type} -> ${notification.userId}`);
+  } catch (error) {
+    console.error('アプリ内通知の作成に失敗:', error);
+  }
+}
+
+async function fetchCwitterUserProfile(userId) {
+  if (!userId) return null;
+  try {
+    const userDoc = await admin.firestore().collection('users').doc(userId).get();
+    if (!userDoc.exists) return null;
+    const data = userDoc.data() || {};
+    const displayName = String(data.displayName || '').trim();
+    const cwitterId = normalizeCwitterId(data.cwitterId);
+    if (!displayName || !cwitterId) return null;
+    return {displayName, cwitterId};
+  } catch (error) {
+    console.error(`Cwitterユーザープロフィール取得に失敗 (${userId}):`, error);
+    return null;
+  }
 }
 
 function parseCwitterImageUrls(raw) {
@@ -525,6 +618,199 @@ exports.notifyCwitterReplyCreated = onDocumentCreated(
         replyId,
       });
       await postToDiscord(getWebhook('cwitter'), payload);
+
+      const replyAuthorId = String(reply.authorId || '').trim();
+      const postAuthorId = String(originalPost.authorId || '').trim();
+      if (replyAuthorId && postAuthorId && replyAuthorId !== postAuthorId) {
+        const fromUserName = String(reply.displayName || '匿名').trim() || '匿名';
+        const fromCwitterId = normalizeCwitterId(reply.cwitterId) || 'unknown';
+        const preview = truncatePreview(originalPost.body, 40);
+        const suffix = preview ? `「${preview}」` : '';
+        await createInAppNotification({
+          userId: postAuthorId,
+          type: 'reply',
+          title: 'Cwitterに返信がありました',
+          message:
+            `${fromUserName} (@${fromCwitterId}) さんがあなたのCweetに返信しました${suffix}`,
+          postId: originalPostId,
+          commentId: replyId,
+          fromUserId: replyAuthorId,
+          fromUserName,
+          data: {source: 'cwitter'},
+        });
+      }
+    },
+);
+
+// Cwitter: いいね時にアプリ内通知
+exports.notifyCwitterLikeCreated = onDocumentCreated(
+    'users/{userId}/cwitter_likes/{postId}',
+    async (event) => {
+      const likerId = event.params.userId;
+      const postId = event.params.postId;
+
+      let postAuthorId = '';
+      let postBody = '';
+      try {
+        const postDoc = await admin.firestore()
+            .collection('cwitter_posts')
+            .doc(postId)
+            .get();
+        if (!postDoc.exists) return;
+        const postData = postDoc.data() || {};
+        postAuthorId = String(postData.authorId || '').trim();
+        postBody = String(postData.body || '');
+      } catch (error) {
+        console.error('いいね対象Cweetの取得に失敗:', error);
+        return;
+      }
+
+      if (!postAuthorId || likerId === postAuthorId) return;
+
+      const likerProfile = await fetchCwitterUserProfile(likerId);
+      if (!likerProfile) return;
+
+      const preview = truncatePreview(postBody, 40);
+      const suffix = preview ? `「${preview}」` : '';
+      await createInAppNotification({
+        userId: postAuthorId,
+        type: 'like',
+        title: 'Cwitterにいいねがつきました',
+        message:
+          `${likerProfile.displayName} (@${likerProfile.cwitterId}) さんがあなたのCweetにいいねしました${suffix}`,
+        postId,
+        fromUserId: likerId,
+        fromUserName: likerProfile.displayName,
+        data: {source: 'cwitter'},
+      });
+    },
+);
+
+// Cwitter: フォロー時にアプリ内通知
+exports.notifyCwitterFollowCreated = onDocumentCreated(
+    'users/{followerId}/cwitter_following/{followeeId}',
+    async (event) => {
+      const snap = event.data;
+      if (!snap) return;
+      if (snap.data()?.suppressNotification === true) return;
+
+      const followerId = event.params.followerId;
+      const followeeId = event.params.followeeId;
+      if (!followerId || !followeeId || followerId === followeeId) return;
+
+      const followerProfile = await fetchCwitterUserProfile(followerId);
+      if (!followerProfile) return;
+
+      await createInAppNotification({
+        userId: followeeId,
+        type: 'follow',
+        title: 'Cwitterでフォローされました',
+        message:
+          `${followerProfile.displayName} (@${followerProfile.cwitterId}) さんがあなたをフォローしました`,
+        fromUserId: followerId,
+        fromUserName: followerProfile.displayName,
+        data: {
+          source: 'cwitter',
+          type: 'follow',
+          fromCwitterId: followerProfile.cwitterId,
+        },
+      });
+    },
+);
+
+// ちばちゃんねる: 新規スレッド作成時にDiscord通知
+exports.notifyChibaChannelThreadCreated = onDocumentCreated(
+    'chiba_channel_threads/{threadId}',
+    async (event) => {
+      const snap = event.data;
+      if (!snap) return;
+
+      const thread = snap.data() || {};
+      const threadId = event.params.threadId;
+      const title = thread.title || '（無題）';
+      const category = thread.category || '未分類';
+      const authorId = thread.authorId || 'unknown';
+      const email = maskEmail(thread.authorEmail || '（未設定）');
+
+      const payload = embed({
+        title: '🧵 新規スレッド（ちばちゃんねる）',
+        description: clampDiscordText(title, 4096),
+        color: 0x9c27b0,
+        fields: [
+          {name: 'カテゴリ', value: clampDiscordText(category, 256), inline: true},
+          {name: 'メール', value: clampDiscordText(email, 256), inline: true},
+          {name: 'UID', value: clampDiscordText(authorId, 1024), inline: false},
+          {name: 'スレッドID', value: clampDiscordText(threadId, 1024), inline: false},
+        ],
+      });
+
+      await postToDiscord(getWebhook('chiba_channel_thread'), payload);
+    },
+);
+
+// ちばちゃんねる: 新規レス作成時にDiscord通知
+exports.notifyChibaChannelCommentCreated = onDocumentCreated(
+    'chiba_channel_threads/{threadId}/comments/{commentId}',
+    async (event) => {
+      const snap = event.data;
+      if (!snap) return;
+
+      const comment = snap.data() || {};
+      if (comment.isDeleted === true) return;
+
+      const threadId = event.params.threadId;
+      const commentId = event.params.commentId;
+      const commentNumber = (comment.commentNumber ?? '?').toString();
+      const anonymousId = comment.anonymousId || '--------';
+      const body = (comment.body || '').trim();
+      const imageUrls = parseCwitterImageUrls(comment.imageUrls);
+      const email = maskEmail(comment.authorEmail || '（未設定）');
+      const replyTo = comment.inReplyToCommentNumber != null
+        ? `>>${comment.inReplyToCommentNumber}`
+        : 'なし';
+
+      let threadTitle = '（タイトル不明）';
+      try {
+        const threadDoc = await admin.firestore()
+            .collection('chiba_channel_threads')
+            .doc(threadId)
+            .get();
+        if (threadDoc.exists) {
+          threadTitle = threadDoc.data()?.title || threadTitle;
+        }
+      } catch (error) {
+        console.error('ちばちゃんねるスレッド取得に失敗:', error);
+      }
+
+      const description = body ||
+        (imageUrls.length > 0 ? '（テキストなし・画像のみ）' : '（内容なし）');
+
+      const fields = [
+        {name: 'スレッド', value: clampDiscordText(threadTitle, 1024), inline: false},
+        {name: 'レス番号', value: clampDiscordText(commentNumber, 256), inline: true},
+        {name: 'ID', value: clampDiscordText(`ID:${anonymousId}`, 256), inline: true},
+        {name: '返信先', value: clampDiscordText(replyTo, 256), inline: true},
+        {name: 'メール', value: clampDiscordText(email, 256), inline: true},
+        {name: 'スレッドID', value: clampDiscordText(threadId, 1024), inline: false},
+        {name: 'レスID', value: clampDiscordText(commentId, 1024), inline: false},
+      ];
+
+      if (imageUrls.length > 0) {
+        fields.push({
+          name: '添付画像',
+          value: clampDiscordText(`${imageUrls.length}枚`, 1024),
+          inline: true,
+        });
+      }
+
+      const payload = embed({
+        title: `💬 新規レス #${commentNumber}（ちばちゃんねる）`,
+        description: clampDiscordText(description, 4096),
+        color: 0x7b1fa2,
+        fields,
+      });
+
+      await postToDiscord(getWebhook('chiba_channel_reply'), payload);
     },
 );
 
@@ -615,30 +901,29 @@ exports.notifyReportCreated = onDocumentCreated('reports/{id}', async (event) =>
 });
 
 // 学食メニュー画像の自動更新（毎日 8:00 AM JST）
+// 公式サイトは PDF (t.pdf / s1.pdf / s2.pdf) を公開 → 1ページ目を PNG 化して Storage へ保存
 // 平日のみにしたい場合は schedule を '0 8 * * 1-5' に変更する
 exports.updateMenuImagesDailyAt8AM = onSchedule({
   schedule: '0 8 * * *',
   timeZone: 'Asia/Tokyo',
   retryCount: 2,
+  memory: '1GiB',
+  timeoutSeconds: 300,
 }, async (event) => {
   console.log('🍽️ 学食メニュー画像更新開始 (毎日 8:00 AM JST)');
   await updateMenuImages();
 });
 
 // 手動実行用（デバッグ/復旧用）
-exports.updateMenuImagesNow = onRequest(async (req, res) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    res.status(204).send('');
-    return;
-  }
+exports.updateMenuImagesNow = onRequest({
+  memory: '1GiB',
+  timeoutSeconds: 300,
+}, async (req, res) => {
+  if (!await authorizeAdmin(req, res)) return;
 
   try {
-    await updateMenuImages();
-    res.status(200).json({ok: true});
+    const result = await updateMenuImages();
+    res.status(200).json({ok: true, ...result});
   } catch (e) {
     console.error('❌ updateMenuImagesNow error:', e);
     res.status(500).json({
@@ -648,15 +933,90 @@ exports.updateMenuImagesNow = onRequest(async (req, res) => {
   }
 });
 
+const MENU_PDF_FALLBACKS = {
+  'td.png': 'https://www.cit-s.com/wp/wp-content/themes/cit/syokudo/t.pdf',
+  'sd1.png': 'https://www.cit-s.com/wp/wp-content/themes/cit/syokudo/s1.pdf',
+  'sd2.png': 'https://www.cit-s.com/wp/wp-content/themes/cit/syokudo/s2.pdf',
+};
+
+function resolveMenuStorageFileName(url) {
+  const lower = String(url || '').toLowerCase();
+  // 現行: 固定PDF名
+  if (lower.endsWith('/t.pdf') || lower.includes('/syokudo/t.pdf')) return 'td.png';
+  if (lower.endsWith('/s1.pdf') || lower.includes('/syokudo/s1.pdf')) return 'sd1.png';
+  if (lower.endsWith('/s2.pdf') || lower.includes('/syokudo/s2.pdf')) return 'sd2.png';
+  // 旧: 週次PNG名（互換）
+  if (lower.includes('td_')) return 'td.png';
+  if (lower.includes('sd1_')) return 'sd1.png';
+  if (lower.includes('sd2_')) return 'sd2.png';
+  return null;
+}
+
+function isPdfBuffer(buf) {
+  if (!buf || buf.length < 5) return false;
+  return buf.slice(0, 5).toString('utf8') === '%PDF-';
+}
+
+function isSupportedImageBuffer(buf) {
+  if (!buf || buf.length < 12) return false;
+  const isPng =
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a;
+  const isJpeg = buf[0] === 0xff && buf[1] === 0xd8;
+  const isGif =
+    buf[0] === 0x47 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x38 &&
+    (buf[4] === 0x37 || buf[4] === 0x39) &&
+    buf[5] === 0x61;
+  const isWebp =
+    buf[0] === 0x52 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x46 &&
+    buf[8] === 0x57 &&
+    buf[9] === 0x45 &&
+    buf[10] === 0x42 &&
+    buf[11] === 0x50;
+  return isPng || isJpeg || isGif || isWebp;
+}
+
+async function convertPdfFirstPageToPng(pdfBuffer, {scale = 2} = {}) {
+  const mupdf = await import('mupdf');
+  const doc = mupdf.Document.openDocument(pdfBuffer, 'application/pdf');
+  const pageCount = doc.countPages();
+  if (pageCount < 1) {
+    throw new Error('PDFにページがありません');
+  }
+  const page = doc.loadPage(0);
+  const pixmap = page.toPixmap(
+    mupdf.Matrix.scale(scale, scale),
+    mupdf.ColorSpace.DeviceRGB,
+    false,
+    true,
+  );
+  const png = Buffer.from(pixmap.asPNG());
+  if (!isSupportedImageBuffer(png)) {
+    throw new Error('PDF→PNG変換結果のシグネチャ検証に失敗');
+  }
+  return png;
+}
+
 // 学食メニュー画像更新の実装
-// 更新: 新習志野食堂のパターンをsd1, sd2に変更 (2025-11-07)
+// 更新: 公式が週次PNG→固定PDF公開に変更したため、PDF 1ページ目を PNG 化して保存 (2026-08-03)
 async function updateMenuImages() {
   try {
     const bucket = admin.storage().bucket();
     const uploadedImageUrls = {};
 
-    // 1. https://www.cit-s.com/dining/ からメニュー画像URLをスクレイピング
-    console.log('🔍 学食ページからメニュー画像URLを取得中...');
+    console.log('🔍 学食ページからメニューPDF URLを取得中...');
     const diningPageUrl = 'https://www.cit-s.com/dining/';
     const requestHeaders = {
       'User-Agent':
@@ -689,136 +1049,120 @@ async function updateMenuImages() {
       throw lastErr;
     }
 
-    const response = await getWithRetry(diningPageUrl, {timeoutMs: 20000, retries: 4});
-    const html = Buffer.from(response.data).toString('utf8');
-    const $ = cheerio.load(html);
+    const sourceByFile = {...MENU_PDF_FALLBACKS};
+    try {
+      const response = await getWithRetry(diningPageUrl, {timeoutMs: 20000, retries: 4});
+      const html = Buffer.from(response.data).toString('utf8');
+      const $ = cheerio.load(html);
 
-    // 画像URLを抽出（td_YYYYMM_W.png, sd1_YYYYMM_W.png, sd2_YYYYMM_W.png パターン）
-    const imageUrls = [];
-    $('img').each((i, elem) => {
-      const src = $(elem).attr('src');
-      if (src && src.includes('/menu/') && (
-        src.includes('td_') ||
-        src.includes('sd1_') ||
-        src.includes('sd2_')
-      )) {
-        // 相対URLを絶対URLに変換
+      $('a[href]').each((_, elem) => {
+        const href = $(elem).attr('href');
+        if (!href) return;
+        const fullUrl = href.startsWith('http') ? href : `https://www.cit-s.com${href}`;
+        const fileName = resolveMenuStorageFileName(fullUrl);
+        if (fileName) {
+          sourceByFile[fileName] = fullUrl;
+        }
+      });
+
+      // 旧PNG形式が残っている場合も拾う
+      $('img[src]').each((_, elem) => {
+        const src = $(elem).attr('src');
+        if (!src) return;
+        if (!src.includes('/menu/')) return;
         const fullUrl = src.startsWith('http') ? src : `https://www.cit-s.com${src}`;
-        imageUrls.push(fullUrl);
-      }
-    });
-
-    // 重複URLを排除
-    const dedupedImageUrls = [...new Set(imageUrls)];
-    console.log(`📷 ${dedupedImageUrls.length} 個のメニュー画像URLを発見:`, dedupedImageUrls);
-
-    if (dedupedImageUrls.length === 0) {
-      // 既存画像を消さないため、ここで失敗として扱う
-      throw new Error('メニュー画像URLが見つかりませんでした');
+        const fileName = resolveMenuStorageFileName(fullUrl);
+        if (fileName) {
+          sourceByFile[fileName] = fullUrl;
+        }
+      });
+    } catch (scrapeErr) {
+      console.warn(
+        `⚠️ 学食ページのスクレイピングに失敗したため固定PDF URLを使用: ${scrapeErr?.message || scrapeErr}`,
+      );
     }
 
-    function isSupportedImageBuffer(buf) {
-      if (!buf || buf.length < 12) return false;
-      // PNG: 89 50 4E 47 0D 0A 1A 0A
-      const isPng =
-        buf[0] === 0x89 &&
-        buf[1] === 0x50 &&
-        buf[2] === 0x4E &&
-        buf[3] === 0x47 &&
-        buf[4] === 0x0D &&
-        buf[5] === 0x0A &&
-        buf[6] === 0x1A &&
-        buf[7] === 0x0A;
-      // JPEG: FF D8 ... FF D9
-      const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8;
-      // GIF: GIF87a / GIF89a
-      const isGif =
-        buf[0] === 0x47 &&
-        buf[1] === 0x49 &&
-        buf[2] === 0x46 &&
-        buf[3] === 0x38 &&
-        (buf[4] === 0x37 || buf[4] === 0x39) &&
-        buf[5] === 0x61;
-      // WEBP: RIFF....WEBP
-      const isWebp =
-        buf[0] === 0x52 &&
-        buf[1] === 0x49 &&
-        buf[2] === 0x46 &&
-        buf[3] === 0x46 &&
-        buf[8] === 0x57 &&
-        buf[9] === 0x45 &&
-        buf[10] === 0x42 &&
-        buf[11] === 0x50;
-      return isPng || isJpeg || isGif || isWebp;
+    const entries = Object.entries(sourceByFile);
+    console.log(
+      `📷 ${entries.length} 件のメニューソースを使用:`,
+      Object.fromEntries(entries),
+    );
+
+    if (entries.length === 0) {
+      throw new Error('メニューPDF/画像URLが見つかりませんでした');
     }
 
-    // 2. 画像をダウンロードしてリネーム・アップロード
     // ※既存ファイルは先に削除しない。取得に成功したものだけ上書きする
-    for (const imageUrl of dedupedImageUrls) {
+    for (const [newFileName, sourceUrl] of entries) {
       try {
-        // URLからファイル名を判定
-        let newFileName = '';
-        if (imageUrl.includes('td_')) {
-          newFileName = 'td.png';
-        } else if (imageUrl.includes('sd1_')) {
-          newFileName = 'sd1.png';
-        } else if (imageUrl.includes('sd2_')) {
-          newFileName = 'sd2.png';
+        console.log(`📥 ダウンロード中: ${sourceUrl} -> ${newFileName}`);
+
+        const sourceResponse = await getWithRetry(sourceUrl, {timeoutMs: 30000, retries: 4});
+        const contentTypeHeader = String(
+          sourceResponse?.headers?.['content-type'] || '',
+        ).toLowerCase();
+        const sourceBuffer = Buffer.from(sourceResponse.data);
+
+        let imageBuffer;
+        let contentType = 'image/png';
+
+        if (
+          contentTypeHeader.includes('application/pdf') ||
+          sourceUrl.toLowerCase().endsWith('.pdf') ||
+          isPdfBuffer(sourceBuffer)
+        ) {
+          if (!isPdfBuffer(sourceBuffer)) {
+            throw new Error('PDFシグネチャ検証に失敗（壊れたレスポンスの可能性）');
+          }
+          console.log(`🖨️ PDF→PNG変換中: ${newFileName}`);
+          imageBuffer = await convertPdfFirstPageToPng(sourceBuffer, {scale: 2});
+        } else if (contentTypeHeader.startsWith('image/') || isSupportedImageBuffer(sourceBuffer)) {
+          if (!isSupportedImageBuffer(sourceBuffer)) {
+            throw new Error('画像シグネチャ検証に失敗（壊れたレスポンスの可能性）');
+          }
+          imageBuffer = sourceBuffer;
+          contentType = contentTypeHeader.startsWith('image/')
+            ? contentTypeHeader.split(';')[0].trim()
+            : 'image/png';
         } else {
-          console.warn(`⚠️ 不明な画像形式: ${imageUrl}`);
-          continue;
+          throw new Error(
+            `未対応のレスポンスを受信: content-type=${contentTypeHeader || 'unknown'}`,
+          );
         }
 
-        console.log(`📥 ダウンロード中: ${imageUrl} -> ${newFileName}`);
-
-        // 画像をダウンロード（サイト側エラー/一時障害に備えてリトライ）
-        const imageResponse = await getWithRetry(imageUrl, {timeoutMs: 30000, retries: 4}).then(
-          (res) => res,
-        );
-        const contentTypeHeader = String(imageResponse?.headers?.['content-type'] || '').toLowerCase();
-        if (!contentTypeHeader.startsWith('image/')) {
-          throw new Error(`画像ではないレスポンスを受信: content-type=${contentTypeHeader || 'unknown'}`);
-        }
-        const imageBuffer = Buffer.from(imageResponse.data);
-        if (!isSupportedImageBuffer(imageBuffer)) {
-          throw new Error('画像シグネチャ検証に失敗（壊れたレスポンスの可能性）');
-        }
-        const contentType = contentTypeHeader || 'image/png';
-
-        // Firebase Storageにアップロード
         const file = bucket.file(`menu_images/${newFileName}`);
         await file.save(imageBuffer, {
           metadata: {
             contentType,
             metadata: {
-              originalUrl: imageUrl,
+              originalUrl: sourceUrl,
               uploadedAt: new Date().toISOString(),
+              sourceType: sourceUrl.toLowerCase().endsWith('.pdf') ? 'pdf' : 'image',
             },
           },
         });
 
-        // 公開URLを設定
         await file.makePublic();
         uploadedImageUrls[newFileName] = file.publicUrl();
 
-        console.log(`✅ アップロード完了: ${newFileName}`);
+        console.log(`✅ アップロード完了: ${newFileName} (${imageBuffer.length} bytes)`);
       } catch (imageError) {
-        console.error(`❌ 画像処理エラー (${imageUrl}):`, imageError.message);
+        console.error(`❌ 画像処理エラー (${sourceUrl}):`, imageError.message);
       }
     }
 
-    // 3. Discordへ更新通知（画像付き）
+    // Discordへ更新通知（画像付き）
     try {
-      const menuWebhook = getWebhook('menu');
-      const entries = [
+      const menuWebhook = getWebhook('menu_image');
+      const notifyEntries = [
         {key: 'td.png', label: '津田沼食堂'},
         {key: 'sd1.png', label: '新習志野食堂 1F'},
         {key: 'sd2.png', label: '新習志野食堂 2F'},
       ].filter((e) => !!uploadedImageUrls[e.key]);
 
-      if (entries.length > 0) {
+      if (notifyEntries.length > 0) {
         const payload = {
-          embeds: entries.map((entry) => ({
+          embeds: notifyEntries.map((entry) => ({
             title: `🍽️ 学食メニュー画像を更新しました（${entry.label}）`,
             description: '最新画像を保存しました。',
             color: 0x57f287,
@@ -838,7 +1182,12 @@ async function updateMenuImages() {
       console.error('❌ 学食更新Discord通知エラー:', notifyErr);
     }
 
+    if (Object.keys(uploadedImageUrls).length === 0) {
+      throw new Error('メニュー画像のアップロードに1件も成功しませんでした');
+    }
+
     console.log('🎉 学食メニュー画像の更新が完了しました');
+    return {uploaded: uploadedImageUrls};
   } catch (error) {
     console.error('❌ 学食メニュー画像更新エラー:', error);
     throw error;
@@ -1206,15 +1555,8 @@ exports.syncClubOrganizationsDaily = onSchedule({
 
 // 手動同期用HTTPエンドポイント（管理用途）
 exports.syncClubOrganizationsNow = onRequest(async (req, res) => {
+  if (!await authorizeAdmin(req, res, 'POST')) return;
   try {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-      res.status(204).send('');
-      return;
-    }
-
     const count = await syncClubOrganizations();
     res.status(200).json({
       ok: true,
@@ -1332,8 +1674,6 @@ exports.notifyGlobalNotificationCreated = onDocumentCreated('global_notification
     const globalPrefKey = 'global_announcement';
     const tokenEntries = [];
     for (const doc of tokensSnapshot.docs) {
-      const data = doc.data();
-      if (!data?.fcmToken) continue;
       const userId = doc.id;
       const pushEnabled = await isPushEnabledForUser(
         userId,
@@ -1341,7 +1681,7 @@ exports.notifyGlobalNotificationCreated = onDocumentCreated('global_notification
         prefsCache,
       );
       if (!pushEnabled) continue;
-      tokenEntries.push({token: data.fcmToken, userId});
+      tokenEntries.push(...await getUserTokenEntries(admin.firestore(), userId));
     }
 
     if (tokenEntries.length === 0) {
@@ -1390,9 +1730,9 @@ exports.notifyGlobalNotificationCreated = onDocumentCreated('global_notification
           if (errorCode === 'messaging/invalid-registration-token' ||
               errorCode === 'messaging/registration-token-not-registered') {
             console.log(`無効なトークンを削除します: ${userId}`);
-            await admin.firestore().collection('user_tokens').doc(userId).delete();
+            await removeInvalidToken(admin.firestore(), chunk[idx], () => admin.firestore.FieldValue.delete());
           } else {
-            console.error(`グローバル通知プッシュ送信エラー (${userId}):`, res.error?.message || errorCode);
+            console.error('Global push delivery failed', {code: errorCode});
           }
         }
       });
@@ -1402,7 +1742,7 @@ exports.notifyGlobalNotificationCreated = onDocumentCreated('global_notification
 
     console.log(`🌐 全体通知プッシュ送信完了: success=${successCount}, failure=${failureCount}`);
   } catch (error) {
-    console.error('全体通知プッシュ送信処理でエラーが発生:', error);
+    console.error('Global push processing failed', {code: error.code});
   }
 });
 
@@ -1429,27 +1769,11 @@ exports.sendPushNotification = onDocumentCreated('notifications/{notificationId}
   }
 
   try {
-    // ユーザーのFCMトークンを取得
-    const tokenDoc = await admin.firestore()
-      .collection('user_tokens')
-      .doc(userId)
-      .get();
-
-    if (!tokenDoc.exists) {
-      console.log(`ユーザーのFCMトークンが見つかりません: ${userId}`);
-      return;
-    }
-
-    const tokenData = tokenDoc.data();
-    const fcmToken = tokenData && tokenData.fcmToken;
-    if (!fcmToken) {
-      console.log('FCMトークンが空です');
-      return;
-    }
+    const tokenEntries = await getUserTokenEntries(admin.firestore(), userId);
+    if (tokenEntries.length === 0) return;
 
     // FCMメッセージを構築
     const message = {
-      token: fcmToken,
       notification: {
         title: notification.title || 'CIT App',
         body: notification.message || notification.body || '',
@@ -1457,6 +1781,10 @@ exports.sendPushNotification = onDocumentCreated('notifications/{notificationId}
       data: {
         notificationId: event.params.notificationId,
         type: notification.type || 'general',
+        source: String(notification.data?.source || ''),
+        userId: String(userId),
+        fromUserId: String(notification.fromUserId || ''),
+        fromCwitterId: String(notification.data?.fromCwitterId || ''),
         postId: notification.postId || '',
         commentId: notification.commentId || '',
         replyId: notification.replyId || '',
@@ -1474,20 +1802,20 @@ exports.sendPushNotification = onDocumentCreated('notifications/{notificationId}
     };
 
     // プッシュ通知を送信
-    await admin.messaging().send(message);
-    console.log(`プッシュ通知を送信しました: ${notification.title} -> ${userId}`);
-  } catch (error) {
-    console.error('プッシュ通知送信エラー:', error);
-
-    // 無効なトークンの場合は削除
-    if (error.code === 'messaging/invalid-registration-token' ||
-        error.code === 'messaging/registration-token-not-registered') {
-      console.log(`無効なトークンを削除します: ${userId}`);
-      await admin.firestore()
-        .collection('user_tokens')
-        .doc(userId)
-        .delete();
+    for (const entry of tokenEntries) {
+      try {
+        await admin.messaging().send({...message, token: entry.token});
+      } catch (error) {
+        if (error.code === 'messaging/invalid-registration-token' ||
+            error.code === 'messaging/registration-token-not-registered') {
+          await removeInvalidToken(admin.firestore(), entry, () => admin.firestore.FieldValue.delete());
+        } else {
+          console.error('Push delivery failed', {code: error.code});
+        }
+      }
     }
+  } catch (error) {
+    console.error('Push processing failed', {code: error.code});
   }
 });
 
@@ -1498,17 +1826,8 @@ exports.trainInfo = createTrainInfoHandler();
 
 // ユーザー数推移を取得するCloud Function
 exports.getUserGrowthStats = onRequest(async (req, res) => {
+  if (!await authorizeAdmin(req, res, 'GET')) return;
   try {
-    // CORS設定
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type');
-
-    if (req.method === 'OPTIONS') {
-      res.status(204).send('');
-      return;
-    }
-
     console.log('📊 ユーザー数推移の取得を開始...');
 
     // 全ユーザーを取得
@@ -1588,64 +1907,5 @@ exports.getUserGrowthStats = onRequest(async (req, res) => {
   }
 });
 
-// 既存ユーザー救済用: usersコレクションの emailVerified / isEmailVerified を一括で true に更新
-exports.bulkVerifyExistingUsersNow = onRequest(async (req, res) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    res.status(204).send('');
-    return;
-  }
-
-  try {
-    const usersRef = admin.firestore().collection('users');
-    const snapshot = await usersRef.get();
-
-    let scanned = 0;
-    let updated = 0;
-    let batch = admin.firestore().batch();
-    let batchOps = 0;
-    const syncedAt = admin.firestore.FieldValue.serverTimestamp();
-
-    for (const doc of snapshot.docs) {
-      scanned += 1;
-      const data = doc.data() || {};
-      if (data.emailVerified === true && data.isEmailVerified === true) {
-        continue;
-      }
-
-      batch.update(doc.ref, {
-        emailVerified: true,
-        isEmailVerified: true,
-        updatedAt: syncedAt,
-      });
-      batchOps += 1;
-      updated += 1;
-
-      if (batchOps >= 450) {
-        await batch.commit();
-        batch = admin.firestore().batch();
-        batchOps = 0;
-      }
-    }
-
-    if (batchOps > 0) {
-      await batch.commit();
-    }
-
-    res.status(200).json({
-      ok: true,
-      scanned,
-      updated,
-      message: '既存ユーザーのemailVerified/isEmailVerified一括更新が完了しました',
-    });
-  } catch (e) {
-    console.error('❌ bulkVerifyExistingUsersNow error:', e);
-    res.status(500).json({
-      ok: false,
-      message: e?.message || String(e),
-    });
-  }
-});
+// Retire the old URL without leaving a previously deployed function active.
+exports.bulkVerifyExistingUsersNow = onRequest(retiredBulkVerification);

@@ -9,6 +9,7 @@ import 'cwitter_avatar.dart';
 import 'cwitter_author_name_row.dart';
 import 'cwitter_handle_text.dart';
 import 'cwitter_profile_screen.dart';
+import 'cwitter_hashtag_users_screen.dart';
 import '../../../core/providers/cwitter_provider.dart';
 
 /// 投稿者アイコン・名前タップでプロフィール（投稿一覧）を開く
@@ -61,24 +62,23 @@ class CwitterAuthorHeader extends ConsumerWidget {
     );
     if (currentUid != null && currentUid == authorId) {
       Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => const CwitterProfileScreen(),
-        ),
+        MaterialPageRoute<void>(builder: (_) => const CwitterProfileScreen()),
       );
       return;
     }
 
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => CwitterProfileScreen(
-          user: CwitterProfileUser(
-            authorId: authorId,
-            displayName: resolvedName,
-            cwitterId: cwitterId,
-            profileImageUrl: profileImageUrl,
-            tags: tags,
-          ),
-        ),
+        builder:
+            (_) => CwitterProfileScreen(
+              user: CwitterProfileUser(
+                authorId: authorId,
+                displayName: resolvedName,
+                cwitterId: cwitterId,
+                profileImageUrl: profileImageUrl,
+                tags: tags,
+              ),
+            ),
       ),
     );
   }
@@ -86,9 +86,9 @@ class CwitterAuthorHeader extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
-    final mutedColor =
-        theme.colorScheme.onSurface.withValues(alpha: 0.65);
-    final tags = ref.watch(cwitterUserTagsProvider(authorId)).valueOrNull ??
+    final mutedColor = theme.colorScheme.onSurface.withValues(alpha: 0.65);
+    final tags =
+        ref.watch(cwitterUserTagsProvider(authorId)).valueOrNull ??
         const <String>[];
     final resolvedName = resolveAuthorDisplayName(
       ref.watch(
@@ -105,6 +105,11 @@ class CwitterAuthorHeader extends ConsumerWidget {
           cwitterId: cwitterId,
           tags: tags,
           compact: true,
+          onTagTap: (tag) => Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => CwitterHashtagUsersScreen(tag: tag),
+            ),
+          ),
         ),
         CwitterHandleText(
           cwitterId: cwitterId,

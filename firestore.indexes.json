@@ -1,6 +1,22 @@
 {
   "indexes": [
     {
+      "collectionGroup": "cafeteria_favorites",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "type", "order": "ASCENDING" },
+        { "fieldPath": "menuItemId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "cafeteria_favorites",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "type", "order": "ASCENDING" },
+        { "fieldPath": "cafeteriaId", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "cwitter_posts",
       "queryScope": "COLLECTION",
       "fields": [
@@ -29,6 +45,14 @@
       "queryScope": "COLLECTION_GROUP",
       "fields": [
         { "fieldPath": "followedAt", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "notifications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
     }
   ],

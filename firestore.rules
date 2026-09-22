@@ -1,10 +1,14 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function isActiveAccount() {
+      return request.auth != null && !exists(/databases/$(database)/documents/account_deletion_jobs/$(request.auth.uid));
+    }
+
 
     // 認証メール（小文字化。Firebase Auth の token.email は大小混在のことがある）
     function authEmailLower() {
-      return request.auth != null && request.auth.token.email != null
+      return isActiveAccount() && request.auth.token.email != null
         ? request.auth.token.email.lower()
         : '';
     }
@@ -18,28 +22,29 @@ service cloud.firestore {
 
     // CITユーザー判定（一般機能・管理者機能の前提）
     function isCITUser() {
-      return request.auth != null
+      return isActiveAccount()
         && request.auth.token.email != null
+        && request.auth.token.get('email_verified', false) == true
         && isAllowedCitEmailDomain();
     }
 
     // 管理者判定（admin_permissions に isAdmin: true が必要）
     // ドメインは isCITUser() 側で別途チェックするコレクションもある
     function isAdmin() {
-      return request.auth != null
+      return isCITUser()
         && exists(/databases/$(database)/documents/admin_permissions/$(request.auth.uid))
         && get(/databases/$(database)/documents/admin_permissions/$(request.auth.uid)).data.get('isAdmin', false) == true;
     }
 
     // 管理者または本人のリソース読み取り
     function isOwnerOrAdmin(userId) {
-      return request.auth != null
+      return isActiveAccount()
         && (request.auth.uid == userId || isAdmin());
     }
 
     // 垢BAN判定（banned_users/{uid} が存在し、永久 or 期限内）
     function isBanned() {
-      return request.auth != null
+      return isActiveAccount()
         && exists(/databases/$(database)/documents/banned_users/$(request.auth.uid))
         && (
           get(/databases/$(database)/documents/banned_users/$(request.auth.uid)).data.get('permanent', false) == true
@@ -135,6 +140,42 @@ service cloud.firestore {
         && request.resource.data.authorEmail == authEmailLower();
     }
 
+    function bulletinContentFields() {
+      return ['title', 'description', 'imageUrl', 'imageUrls', 'thumbAlignX', 'thumbAlignY', 'thumbScale',
+        'externalUrl', 'category', 'expiresAt', 'authorName', 'isActive',
+        'allowComments', 'pinRequested', 'pinRequestedAt', 'isCoupon',
+        'couponMaxUses', 'submittedAt', 'updatedAt'];
+    }
+
+    function bulletinOwnerUpdate() {
+      let changes = request.resource.data.diff(resource.data).affectedKeys();
+      return resource.data.authorId == request.auth.uid
+        && changes.hasOnly(bulletinContentFields().concat(
+          ['approvalStatus', 'approvedAt', 'approvedBy']))
+        && (!changes.hasAny(['approvalStatus', 'approvedAt', 'approvedBy'])
+          || (request.resource.data.approvalStatus == 'pending'
+            && request.resource.data.get('approvedAt', null) == null
+            && request.resource.data.get('approvedBy', null) == null));
+    }
+
+    function validSponsorship() {
+      return request.resource.data.get('isSponsored', false) is bool
+        && request.resource.data.get('sponsorName', '') is string
+        && request.resource.data.get('sponsorName', '').size() <= 80
+        && (!request.resource.data.get('isSponsored', false)
+          || request.resource.data.get('sponsorName', '').size() > 0);
+    }
+
+    function bulletinAdminUpdate() {
+      return isAdmin()
+        && validSponsorship()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+          bulletinContentFields().concat(['isPinned', 'approvalStatus',
+            'approvedAt', 'approvedBy', 'rejectionReason', 'pinRejectedReason',
+            'isSponsored', 'sponsorName']))
+        && request.resource.data.approvalStatus in ['pending', 'approved', 'rejected'];
+    }
+
     // 掲示板投稿のルール
     match /bulletin_posts/{postId} {
       // 認証済みCITユーザーのみ読み取り可能
@@ -142,16 +183,27 @@ service cloud.firestore {
 
       // 認証済みCITユーザーのみ作成可能
       allow create: if isCITUser()
-        && request.auth != null
-        && request.resource.data.authorId == request.auth.uid;
+        && isActiveAccount()
+        && request.resource.data.authorId == request.auth.uid
+        && validSponsorship()
+        && (isAdmin() || (request.resource.data.approvalStatus == 'pending'
+          && request.resource.data.get('isSponsored', false) == false
+          && request.resource.data.get('sponsorName', '') == ''
+          && request.resource.data.get('isPinned', false) == false
+          && request.resource.data.get('approvedAt', null) == null
+          && request.resource.data.get('approvedBy', null) == null))
+        && request.resource.data.get('viewCount', 0) == 0
+        && request.resource.data.get('couponUsedCount', 0) == 0
+        && (request.resource.data.get('couponUsedBy', null) == null
+          || request.resource.data.couponUsedBy == {});
 
-      // 更新は認証済みユーザーなら無条件で許可（画面到達には認証が必須のため）
-      // NOTE: セキュリティを緩和しています。必要になったらフィールド制限を戻してください。
-      allow update: if request.auth != null;
+      allow update: if isCITUser()
+        && (bulletinOwnerUpdate() || bulletinAdminUpdate()
+          || isViewCountOnlyUpdate() || isCouponUseUpdate());
 
       // 作成者または管理者のみ削除可能
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (resource.data.authorId == request.auth.uid || isAdmin());
     }
 
@@ -159,18 +211,18 @@ service cloud.firestore {
     match /bulletin_comments/{commentId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.authorId == request.auth.uid
         && hasRequiredCommentFields();
 
       // コメント作者のみが削除・編集可能
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.authorId == request.auth.uid;
 
       // いいね操作は認証済みCITユーザーなら誰でも可能、その他の更新は作者のみ
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (resource.data.authorId == request.auth.uid || isLikeOnlyUpdate());
     }
 
@@ -178,7 +230,7 @@ service cloud.firestore {
     match /reports/{reportId} {
       // 認証済みCITユーザーのみが通報を作成可能
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.reporterId == request.auth.uid
         && hasRequiredReportFields();
 
@@ -190,19 +242,19 @@ service cloud.firestore {
     match /hidden_posts/{hiddenId} {
       // 認証済みCITユーザーのみが非表示投稿を作成可能
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data != null
         && request.resource.data.userId == request.auth.uid
         && hasRequiredHiddenPostFields();
 
       // 自分の非表示投稿のみ削除可能
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
 
       // 自分の非表示投稿のみ読み取り可能
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
     }
 
@@ -210,19 +262,19 @@ service cloud.firestore {
     match /hidden_comments/{hiddenId} {
       // 認証済みCITユーザーのみが非表示コメントを作成可能
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data != null
         && request.resource.data.userId == request.auth.uid
         && hasRequiredHiddenCommentFields();
 
       // 自分の非表示コメントのみ削除可能
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
 
       // 自分の非表示コメントのみ読み取り可能
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
     }
 
@@ -230,19 +282,19 @@ service cloud.firestore {
     match /blocked_users/{blockedId} {
       // 認証済みCITユーザーのみがユーザーブロックを作成可能
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data != null
         && request.resource.data.userId == request.auth.uid
         && hasRequiredBlockedUserFields();
 
       // 自分のブロックのみ削除可能
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
 
       // 自分のブロックのみ読み取り可能（相手側は被ブロック判定のため blockedUserId も可）
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (
           resource.data.userId == request.auth.uid
           || resource.data.blockedUserId == request.auth.uid
@@ -252,19 +304,19 @@ service cloud.firestore {
     // 通知のルール（個人向け通知）
     match /notifications/{notificationId} {
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
 
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && hasRequiredNotificationFields();
 
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
 
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
     }
 
@@ -291,8 +343,20 @@ service cloud.firestore {
     // FCMトークンのルール
     match /user_tokens/{userId} {
       allow read, write: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && userId == request.auth.uid;
+      allow read: if isActiveAccount() && userId == request.auth.uid;
+      allow update: if isActiveAccount() && userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fcmToken'])
+        && !('fcmToken' in request.resource.data);
+
+      match /devices/{installationId} {
+        allow read, delete: if isActiveAccount() && request.auth.uid == userId;
+        allow create, update: if isCITUser() && request.auth.uid == userId
+          && request.resource.data.keys().hasOnly(['fcmToken', 'platform', 'updatedAt'])
+          && request.resource.data.fcmToken is string
+          && request.resource.data.fcmToken.size() > 0;
+      }
     }
 
     // バス情報のルール
@@ -322,12 +386,28 @@ service cloud.firestore {
       allow delete: if isCITUser() && request.auth.uid == userId;
     }
 
+    function isOwnCitProfile(userId) {
+      return isActiveAccount() && request.auth.uid == userId
+        && isAllowedCitEmailDomain();
+    }
+
+    // 認証前の本人プロフィール作成は許可するが、認証情報の自己申告は不可。
+    function profileAuthFieldsValid() {
+      let data = request.resource.data;
+      let verified = request.auth.token.get('email_verified', false);
+      return (!('uid' in data) || data.uid == request.auth.uid)
+        && (!('email' in data) || data.email.lower() == authEmailLower())
+        && (!('emailVerified' in data) || data.emailVerified == verified)
+        && (!('isEmailVerified' in data) || data.isEmailVerified == verified);
+    }
+
     // ユーザー管理のルール
     match /users/{userId} {
-      allow read: if isCITUser();
-      allow create: if isCITUser() && request.auth.uid == userId;
-      allow update: if isCITUser()
-        && request.auth.uid == userId
+      allow read: if isCITUser() || isOwnCitProfile(userId);
+      allow create: if isOwnCitProfile(userId) && profileAuthFieldsValid();
+      allow update: if isOwnCitProfile(userId)
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(
+          ['uid', 'email', 'emailVerified', 'isEmailVerified']) || profileAuthFieldsValid())
         && cwitterIdFieldValidOnUpdate()
         && cwitterBioFieldValidOnUpdate()
         && cwitterTagsFieldValidOnUpdate()
@@ -339,7 +419,7 @@ service cloud.firestore {
     match /cwitter_ids/{cwitterId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == request.resource.data.uid
         && isValidCwitterIdLower(cwitterId)
         && request.resource.data.cwitterId == cwitterId
@@ -574,7 +654,7 @@ service cloud.firestore {
     match /cwitter_posts/{postId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == request.resource.data.authorId
         && authorOwnsCwitterId(request.resource.data.cwitterId)
         && isValidCwitterIdLower(request.resource.data.cwitterId)
@@ -589,7 +669,7 @@ service cloud.firestore {
           'replyCount', 'likeCount', 'recweetCount', 'likedBy'
         ]);
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (
           resource.data.authorId == request.auth.uid
           || isCwitterLikeOnlyUpdate()
@@ -598,14 +678,14 @@ service cloud.firestore {
           || isCwitterPollVoteOnlyUpdate()
         );
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.authorId == request.auth.uid;
 
       // Cwitter 返信
       match /replies/{replyId} {
         allow read: if isCITUser();
         allow create: if isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && request.auth.uid == request.resource.data.authorId
           && authorOwnsCwitterId(request.resource.data.cwitterId)
           && isValidCwitterIdLower(request.resource.data.cwitterId)
@@ -618,7 +698,7 @@ service cloud.firestore {
             'authorId', 'authorEmail', 'cwitterId', 'displayName', 'body', 'createdAt'
           ]);
         allow delete: if isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && resource.data.authorId == request.auth.uid;
         allow update: if false;
       }
@@ -628,7 +708,7 @@ service cloud.firestore {
     match /cwitter_replies/{replyIndexId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == request.resource.data.authorId
         && authorOwnsCwitterId(request.resource.data.cwitterId)
         && isValidCwitterIdLower(request.resource.data.cwitterId)
@@ -645,7 +725,7 @@ service cloud.firestore {
           'displayName', 'body', 'createdAt'
         ]);
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.authorId == request.auth.uid;
       allow update: if false;
     }
@@ -654,7 +734,7 @@ service cloud.firestore {
     match /chiba_channel_threads/{threadId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == request.resource.data.authorId
         && chibaChannelAuthorEmailValidOnCreate()
         && !isBanned()
@@ -670,19 +750,19 @@ service cloud.firestore {
           'createdAt', 'lastActivityAt'
         ]);
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (
           isChibaChannelCommentCountOnlyUpdate()
           || isChibaChannelThreadActivityUpdate()
         );
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (resource.data.authorId == request.auth.uid || isAdmin());
 
       match /comments/{commentId} {
         allow read: if isCITUser();
         allow create: if isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && request.auth.uid == request.resource.data.authorId
           && chibaChannelAuthorEmailValidOnCreate()
           && !isBanned()
@@ -703,14 +783,14 @@ service cloud.firestore {
             'authorId', 'authorEmail', 'body', 'commentNumber', 'anonymousId', 'createdAt'
           ]);
         allow delete: if isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && (
             resource.data.authorId == request.auth.uid
             || isAdmin()
             || get(/databases/$(database)/documents/chiba_channel_threads/$(threadId)).data.authorId == request.auth.uid
           );
         allow update: if isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && (
             isChibaChannelCommentSoftDeleteUpdate()
             || isAdmin()
@@ -720,7 +800,7 @@ service cloud.firestore {
       match /anonymous_ids/{userId} {
         allow read: if isCITUser();
         allow create: if isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && request.auth.uid == userId
           && chibaChannelAnonymousIdValid(request.resource.data.anonymousId)
           && !isBanned()
@@ -728,7 +808,7 @@ service cloud.firestore {
           && request.resource.data.keys().hasAll(['anonymousId', 'createdAt']);
         allow update: if false;
         allow delete: if isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && (
             isAdmin()
             || get(/databases/$(database)/documents/chiba_channel_threads/$(threadId)).data.authorId == request.auth.uid
@@ -739,14 +819,14 @@ service cloud.firestore {
     // Cwitter いいね一覧（プロフィールの「いいね」タブ用）
     match /users/{userId}/cwitter_likes/{postId} {
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId;
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId
         && request.resource.data.keys().hasAll(['likedAt']);
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId;
       allow update: if false;
     }
@@ -760,7 +840,7 @@ service cloud.firestore {
     match /users/{userId}/cwitter_recweets/{postId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId
         && !isBanned()
         && request.resource.data.postId == postId
@@ -768,7 +848,7 @@ service cloud.firestore {
         && request.resource.data.displayName is string
         && request.resource.data.cwitterId is string;
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId;
       allow update: if false;
     }
@@ -777,11 +857,11 @@ service cloud.firestore {
     match /users/{userId}/cwitter_following/{targetId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId
         && request.auth.uid != targetId;
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId;
       allow update: if false;
     }
@@ -795,11 +875,11 @@ service cloud.firestore {
     match /users/{userId}/cwitter_followers/{followerId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == followerId
         && request.auth.uid != userId;
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == followerId;
       allow update: if false;
     }
@@ -854,11 +934,11 @@ service cloud.firestore {
     match /users/{userId}/cwitter_social/{docId} {
       allow read: if isCITUser();
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && docId == 'stats'
         && isValidCwitterFollowStatsCreate(userId);
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && docId == 'stats'
         && isValidCwitterFollowStatsUpdate(userId);
       allow delete: if false;
@@ -867,10 +947,10 @@ service cloud.firestore {
     // Cwitter 投稿・返信 / ちばちゃんねるレスの連投防止
     match /users/{userId}/rate_limits/{limitKey} {
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId;
       allow create, update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId
         && (limitKey == 'cwitter_post'
           || limitKey == 'cwitter_reply'
@@ -889,30 +969,36 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // 人数だけを共有する。個人のお気に入り一覧は引き続き本人専用。
+    match /cafeteria_favorite_stats/{targetId} {
+      allow read: if isCITUser();
+      allow write: if false;
+    }
+
     // 学食お気に入りのルール（サブコレクション）
     match /users/{userId}/cafeteria_favorites/{favoriteId} {
       // 読み取り: 自分のお気に入りのみ
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId;
 
       // 作成: 自分のお気に入りのみ、必須フィールドを満たすこと
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId
         && hasRequiredCafeteriaFavoriteFields();
 
       // 更新: 自分のお気に入りのみ
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.auth.uid == userId
-        && resource.data.userId == request.auth.uid;
+        && resource.data.userId == request.auth.uid
+        && hasRequiredCafeteriaFavoriteFields();
 
       // 削除: 自分のお気に入りのみ
       allow delete: if isCITUser()
-        && request.auth != null
-        && request.auth.uid == userId
-        && resource.data.userId == request.auth.uid;
+        && isActiveAccount()
+        && request.auth.uid == userId;
     }
 
     // 管理者のルール
@@ -922,7 +1008,7 @@ service cloud.firestore {
 
     // 垢BAN（運営のみが作成・解除可能。本人と管理者が読み取り可能）
     match /banned_users/{bannedUserId} {
-      allow read: if request.auth != null
+      allow read: if isActiveAccount()
         && (request.auth.uid == bannedUserId || isAdmin());
       allow create, update, delete: if isAdmin();
     }
@@ -930,7 +1016,7 @@ service cloud.firestore {
     // BAN中ユーザーの投稿を全員から非表示にするための公開索引。
     // 理由などの機微情報は含まず UID と期限のみ。認証済みユーザーは読み取り可、書き込みは管理者のみ。
     match /moderation/{docId} {
-      allow read: if request.auth != null;
+      allow read: if isActiveAccount();
       allow write: if isAdmin();
     }
 
@@ -938,21 +1024,21 @@ service cloud.firestore {
     match /admin_permissions/{adminId} {
       // 自分の権限か、管理者なら読み取り可能
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (request.auth.uid == adminId
             || (exists(/databases/$(database)/documents/admin_permissions/$(request.auth.uid))
                 && get(/databases/$(database)/documents/admin_permissions/$(request.auth.uid)).data.get('isAdmin', false) == true));
 
       // 管理者のみが作成・更新可能
       allow create, update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && exists(/databases/$(database)/documents/admin_permissions/$(request.auth.uid))
         && get(/databases/$(database)/documents/admin_permissions/$(request.auth.uid)).data.get('isAdmin', false) == true
         && hasRequiredAdminPermissionFields();
 
       // 管理者のみが削除可能
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && exists(/databases/$(database)/documents/admin_permissions/$(request.auth.uid))
         && get(/databases/$(database)/documents/admin_permissions/$(request.auth.uid)).data.get('isAdmin', false) == true;
     }
@@ -974,22 +1060,46 @@ service cloud.firestore {
     // 時間割のルール
     match /schedules/{scheduleId} {
       allow read: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
 
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.userId == request.auth.uid
         && hasRequiredScheduleFields();
 
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid
         && request.resource.data.userId == request.auth.uid;
 
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && resource.data.userId == request.auth.uid;
+    }
+
+    // Personal assignments. Even administrators cannot read another user's tasks.
+    match /users/{userId}/assignments/{assignmentId} {
+      function owner() { return isCITUser() && request.auth.uid == userId; }
+      function validAssignment() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['title', 'notes', 'dueAt', 'hasDueTime', 'course', 'isCompleted', 'createdAt', 'updatedAt'])
+          && d.keys().hasAll(['title', 'notes', 'dueAt', 'hasDueTime', 'course', 'isCompleted', 'createdAt', 'updatedAt'])
+          && d.title is string && d.title.size() > 0 && d.title.size() <= 120
+          && !d.title.matches('[\\s]*')
+          && d.notes is string && d.notes.size() <= 4000
+          && d.dueAt is timestamp && d.hasDueTime is bool && d.isCompleted is bool
+          && d.createdAt is timestamp && d.updatedAt == request.time
+          && (d.course == null || (d.course is map
+            && d.course.keys().hasOnly(['scheduleId', 'classId', 'subjectName', 'semester'])
+            && d.course.scheduleId is string && d.course.scheduleId.size() > 0 && d.course.scheduleId.size() <= 128
+            && d.course.classId is string && d.course.classId.size() > 0 && d.course.classId.size() <= 128
+            && d.course.subjectName is string && d.course.subjectName.size() > 0 && d.course.subjectName.size() <= 300
+            && d.course.semester is string && d.course.semester.size() <= 100));
+      }
+      allow read, delete: if owner();
+      allow create: if owner() && validAssignment() && request.resource.data.createdAt == request.time;
+      allow update: if owner() && validAssignment() && request.resource.data.createdAt == resource.data.createdAt;
     }
 
     // 出欠記録
@@ -997,17 +1107,17 @@ service cloud.firestore {
       allow read: if isOwnerOrAdmin(resource.data.userId);
 
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.userId == request.auth.uid
         && hasRequiredAttendanceFields();
 
       allow update: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.userId == request.auth.uid
         && hasRequiredAttendanceFields();
 
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (resource.data.userId == request.auth.uid || isAdmin());
     }
 
@@ -1018,7 +1128,7 @@ service cloud.firestore {
 
       // 提供データの作成は本人のみ
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.userId == request.auth.uid
         && hasRequiredExcelImportTrainingFields();
 
@@ -1029,7 +1139,7 @@ service cloud.firestore {
     match /contact_forms/{contactId} {
       // 認証済みCITユーザーのみがお問い合わせを作成可能
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.userId == request.auth.uid
         && hasRequiredContactFormFields();
 
@@ -1050,7 +1160,7 @@ service cloud.firestore {
 
       // 作成: 本人のみ、必須フィールドを満たすこと
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && request.resource.data.userId == request.auth.uid
         && hasRequiredCafeteriaReviewFields();
 
@@ -1059,7 +1169,7 @@ service cloud.firestore {
 
       // 削除: 本人または管理者
       allow delete: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && (resource.data.userId == request.auth.uid || isAdmin());
     }
 
@@ -1070,14 +1180,14 @@ service cloud.firestore {
 
       // 作成: 認証済みCITユーザー、必須フィールドを満たすこと
       allow create: if isCITUser()
-        && request.auth != null
+        && isActiveAccount()
         && hasRequiredCafeteriaMenuItemFields();
 
       // 閲覧数(viewCount)を1増やす更新は全認証ユーザーに許可
       allow update: if isAdmin()
         || (
           isCITUser()
-          && request.auth != null
+          && isActiveAccount()
           && request.resource.data.diff(resource.data).changedKeys().hasOnly(['viewCount'])
           && request.resource.data.viewCount is int
           && (
@@ -1097,12 +1207,12 @@ service cloud.firestore {
 
       // 作成・更新: 管理者のみ
       allow create, update: if isAdmin()
-        && request.auth != null
+        && isActiveAccount()
         && hasRequiredInAppAdFields();
 
       // 削除: 管理者のみ
       allow delete: if isAdmin()
-        && request.auth != null;
+        && isActiveAccount();
     }
 
     // ヘルパー関数
@@ -1111,12 +1221,13 @@ service cloud.firestore {
     }
 
     function isOwner(resource) {
-      return request.auth != null && resource.data.authorId == request.auth.uid;
+      return isActiveAccount() && resource.data.authorId == request.auth.uid;
     }
 
     function isViewCountOnlyUpdate() {
-      return request.resource.data.keys().hasAll(resource.data.keys())
-        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['viewCount']);
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewCount'])
+        && request.resource.data.viewCount is int
+        && request.resource.data.viewCount == resource.data.get('viewCount', 0) + 1;
     }
 
     function isLikeOnlyUpdate() {
@@ -1128,40 +1239,21 @@ service cloud.firestore {
     // 変更できるのは couponUsedCount と couponUsedBy のみ。
     // 自分の使用回数を +1 し、合計も +1 であること、上限超過しないことを検証。
     function isCouponUseUpdate() {
-      return resource.data.isCoupon == true
-        // 変更キーは2つのみ
-        && request.resource.data.keys().hasAll(resource.data.keys())
-        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['couponUsedCount', 'couponUsedBy'])
-        // couponUsedCount は旧値があれば +1、無ければ 1
-        && (
-          (resource.data.couponUsedCount is int && request.resource.data.couponUsedCount == resource.data.couponUsedCount + 1)
-          || (!(resource.data.couponUsedCount is int) && request.resource.data.couponUsedCount == 1)
-        )
-        // 自分の使用回数が +1 になっていること
-        && (
-          // 旧データに couponUsedBy が無い/Mapでない → 自分のキーのみ 1
-          (((resource.data.couponUsedBy is map) == false)
-            && (request.resource.data.couponUsedBy is map)
-            && request.resource.data.couponUsedBy.keys().hasOnly([request.auth.uid])
-            && request.resource.data.couponUsedBy[request.auth.uid] == 1)
-          ||
-          // 旧データが Map → 変更キーは自分のみ かつ new == old+1（old が未定義なら 1）
-          ((resource.data.couponUsedBy is map) && (request.resource.data.couponUsedBy is map)
-            && request.resource.data.couponUsedBy.diff(resource.data.couponUsedBy).changedKeys().hasOnly([request.auth.uid])
-            && (
-              (resource.data.couponUsedBy[request.auth.uid] is int
-                && request.resource.data.couponUsedBy[request.auth.uid] == resource.data.couponUsedBy[request.auth.uid] + 1)
-              || (!(resource.data.couponUsedBy[request.auth.uid] is int)
-                && request.resource.data.couponUsedBy[request.auth.uid] == 1)
-            )
-          )
-        )
-        // 上限が設定されている場合は超えない（null 等の非 int は無制限扱い）
-        && (
-          !('couponMaxUses' in resource.data)
-          || !(resource.data.couponMaxUses is int)
-          || request.resource.data.couponUsedBy[request.auth.uid] <= resource.data.couponMaxUses
-        );
+      let before = resource.data.get('couponUsedBy', null) is map
+        ? resource.data.couponUsedBy : {};
+      let after = request.resource.data.get('couponUsedBy', {});
+      let used = before.get(request.auth.uid, 0);
+      let maximum = resource.data.get('couponMaxUses', null);
+      return resource.data.get('isCoupon', false) == true
+        && resource.data.get('isActive', true) == true
+        && resource.data.get('approvalStatus', '') == 'approved'
+        && (resource.data.get('expiresAt', null) == null || resource.data.expiresAt > request.time)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['couponUsedCount', 'couponUsedBy'])
+        && after is map
+        && after.diff(before).affectedKeys().hasOnly([request.auth.uid])
+        && after.get(request.auth.uid, 0) == used + 1
+        && request.resource.data.couponUsedCount == resource.data.get('couponUsedCount', 0) + 1
+        && (!(maximum is int) || after[request.auth.uid] <= maximum);
     }
 
     function hasRequiredCommentFields() {
@@ -1340,7 +1432,7 @@ service cloud.firestore {
     
     // 学食レビュー更新許可判定（本人のみ、変更できるキーと値を制限）
     function hasValidCafeteriaReviewUpdate() {
-      return request.auth != null
+      return isActiveAccount()
         && resource.data.userId == request.auth.uid
         // 固定フィールドは不変
         && request.resource.data.userId == resource.data.userId
@@ -1381,7 +1473,7 @@ service cloud.firestore {
     }
 
     function hasRequiredInAppAdFields() {
-      return request.resource.data.keys().hasAll([
+      return validSponsorship() && request.resource.data.keys().hasAll([
           'title','body','targetType','actionType','actionPayload','isActive','weight'
         ])
         && request.resource.data.title is string
