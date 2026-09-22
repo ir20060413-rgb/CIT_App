@@ -1,0 +1,19 @@
+{
+  "name": "CIT App (Flutter Web)",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh",
+  "chromeExecutablePath": "/usr/local/bin/google-chrome",
+  "terminals": [
+    {
+      "name": "flutter-web",
+      "description": "Serves the CIT App Flutter web build at http://localhost:8080 with hot restart.",
+      "command": "export PATH=\"$HOME/flutter/bin:$PATH\"; export CHROME_EXECUTABLE=/usr/local/bin/google-chrome; flutter run -d web-server --web-hostname 0.0.0.0 --web-port 8080"
+    }
+  ],
+  "ports": [
+    {
+      "name": "Flutter web dev server",
+      "port": 8080
+    }
+  ]
+}
